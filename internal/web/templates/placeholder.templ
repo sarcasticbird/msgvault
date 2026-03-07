@@ -1,0 +1,10 @@
+package templates
+
+templ Placeholder(title string, activePage string) {
+	@Layout(title, activePage) {
+		<div class="empty-state">
+			<div class="empty-state-title">{ title }</div>
+			<p>Coming soon.</p>
+		</div>
+	}
+}

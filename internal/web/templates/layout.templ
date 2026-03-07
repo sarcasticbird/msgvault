@@ -1,0 +1,32 @@
+package templates
+
+templ Layout(title string, activePage string) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="UTF-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+			<title>{ title } - msgvault</title>
+			<link rel="stylesheet" href="/static/style.css"/>
+			<!-- htmx 2.0.4 - vendored from https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js -->
+			<script src="/static/htmx.min.js"></script>
+		</head>
+		<body>
+			<div class="app">
+				<header class="header">
+					<span class="header-title">msgvault</span>
+					<nav class="header-nav">
+						<a href="/" class={ templ.KV("active", activePage == "dashboard") }>Dashboard</a>
+						<a href="/browse" class={ templ.KV("active", activePage == "browse") }>Browse</a>
+						<a href="/messages" class={ templ.KV("active", activePage == "messages") }>Messages</a>
+						<a href="/search" class={ templ.KV("active", activePage == "search") }>Search</a>
+					</nav>
+				</header>
+				{ children... }
+				<footer class="footer">
+					msgvault
+				</footer>
+			</div>
+		</body>
+	</html>
+}
