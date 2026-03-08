@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/wesm/msgvault/internal/query"
+	"github.com/wesm/msgvault/internal/search"
 	"github.com/wesm/msgvault/internal/web/templates"
 )
 
@@ -271,6 +272,77 @@ func (h *Handler) handleMessageDetail(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
 	if err := templates.MessageDetailPage(data).Render(ctx, &buf); err != nil {
 		slog.Error("failed to render message detail", "error", err)
+		http.Error(w, "Failed to render page", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = buf.WriteTo(w)
+}
+
+func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	queryStr := r.URL.Query().Get("q")
+	mode := r.URL.Query().Get("mode")
+	if mode != "deep" {
+		mode = "fast"
+	}
+	page := parsePage(r)
+	pageSize := 100
+
+	data := templates.SearchData{
+		Query:    queryStr,
+		Mode:     mode,
+		Page:     page,
+		PageSize: pageSize,
+	}
+
+	if queryStr != "" {
+		parsed := search.Parse(queryStr)
+		offset := (page - 1) * pageSize
+
+		var messages []query.MessageSummary
+		var err error
+
+		if mode == "deep" {
+			messages, err = h.engine.Search(ctx, parsed, pageSize+1, offset)
+		} else {
+			result, searchErr := h.engine.SearchFastWithStats(
+				ctx, parsed, queryStr, query.MessageFilter{},
+				query.ViewSenders, pageSize+1, offset,
+			)
+			if searchErr == nil {
+				messages = result.Messages
+				data.Stats = result.Stats
+			}
+			err = searchErr
+		}
+
+		if err != nil {
+			slog.Error("search failed", "error", err, "query", queryStr, "mode", mode)
+			http.Error(w, "Search failed", http.StatusInternalServerError)
+			return
+		}
+
+		if len(messages) > pageSize {
+			data.HasMore = true
+			messages = messages[:pageSize]
+		}
+		data.Messages = messages
+	}
+
+	// Ensure stats bar is always shown (deep search doesn't return stats)
+	if data.Stats == nil {
+		stats, statsErr := h.engine.GetTotalStats(ctx, query.StatsOptions{})
+		if statsErr != nil {
+			slog.Error("failed to get stats for search page", "error", statsErr)
+		} else {
+			data.Stats = stats
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := templates.Search(data).Render(ctx, &buf); err != nil {
+		slog.Error("failed to render search", "error", err)
 		http.Error(w, "Failed to render page", http.StatusInternalServerError)
 		return
 	}

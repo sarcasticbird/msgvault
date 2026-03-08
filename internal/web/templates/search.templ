@@ -1,0 +1,197 @@
+package templates
+
+import (
+	"fmt"
+	"net/url"
+	"github.com/wesm/msgvault/internal/query"
+)
+
+type SearchData struct {
+	Query    string
+	Mode     string // "fast" or "deep"
+	Messages []query.MessageSummary
+	Page     int
+	PageSize int
+	HasMore  bool
+	Stats    *query.TotalStats
+}
+
+func (d SearchData) searchURL(page int) string {
+	q := url.Values{}
+	q.Set("q", d.Query)
+	q.Set("mode", d.Mode)
+	if page > 1 {
+		q.Set("page", fmt.Sprintf("%d", page))
+	}
+	return "/search?" + q.Encode()
+}
+
+func (d SearchData) modeToggleURL() string {
+	q := url.Values{}
+	q.Set("q", d.Query)
+	if d.Mode == "fast" {
+		q.Set("mode", "deep")
+	} else {
+		q.Set("mode", "fast")
+	}
+	return "/search?" + q.Encode()
+}
+
+func (d SearchData) otherMode() string {
+	if d.Mode == "fast" {
+		return "deep"
+	}
+	return "fast"
+}
+
+templ Search(data SearchData) {
+	@Layout("Search", "search") {
+		if data.Stats != nil {
+			@StatsBar(data.Stats)
+		}
+		<form action="/search" method="get" style="margin-bottom: 16px;">
+			<div style="display: flex; gap: 8px; align-items: stretch;">
+				<input
+					type="text"
+					name="q"
+					value={ data.Query }
+					placeholder="Search messages... (e.g. from:user@example.com invoice)"
+					autofocus
+					style="flex: 1; padding: 8px 12px; font-size: 14px; font-family: var(--font); border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--fg); outline: none;"
+				/>
+				<input type="hidden" name="mode" value={ data.Mode }/>
+				<button
+					type="submit"
+					style="padding: 8px 16px; font-size: 14px; font-weight: 600; border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent); color: #fff; cursor: pointer;"
+				>
+					Search
+				</button>
+			</div>
+			<div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 12px;">
+				if data.Mode == "fast" {
+					<span style="padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; background: var(--accent); color: #fff;">
+						Fast
+					</span>
+					<a
+						href={ templ.SafeURL(data.modeToggleURL()) }
+						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
+					>
+						Deep
+					</a>
+				} else {
+					<a
+						href={ templ.SafeURL(data.modeToggleURL()) }
+						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
+					>
+						Fast
+					</a>
+					<span style="padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; background: var(--accent); color: #fff;">
+						Deep
+					</span>
+				}
+				<span style="color: var(--fg-muted);">
+					if data.Mode == "fast" {
+						Searches subject and sender (faster)
+					} else {
+						Searches full message body (slower)
+					}
+				</span>
+			</div>
+		</form>
+		if data.Query == "" {
+			<div class="empty-state">
+				<div class="empty-state-title">Search your archive</div>
+				<p>Use Gmail-like syntax: from:user@example.com, subject:invoice, has:attachment, before:2024/01/01</p>
+			</div>
+		} else if len(data.Messages) == 0 {
+			<div class="empty-state">
+				<div class="empty-state-title">No results</div>
+				<p>
+					No messages match "{ data.Query }"
+					if data.Mode == "fast" {
+						— try <a href={ templ.SafeURL(data.modeToggleURL()) }>deep search</a> to include message bodies
+					}
+				</p>
+			</div>
+		} else {
+			<div style="margin-bottom: 8px; font-size: 12px; color: var(--fg-muted);">
+				Showing { formatCount(int64(len(data.Messages))) } results
+				if data.Page > 1 {
+					(page { fmt.Sprintf("%d", data.Page) })
+				}
+			</div>
+			@searchResultsTable(data)
+			@searchPagination(data)
+		}
+	}
+}
+
+templ searchResultsTable(data SearchData) {
+	<table class="data-table">
+		<thead>
+			<tr>
+				<th>Date</th>
+				<th>From</th>
+				<th>Subject</th>
+				<th class="num">Size</th>
+			</tr>
+		</thead>
+		<tbody>
+			for _, msg := range data.Messages {
+				<tr>
+					<td style="white-space: nowrap; font-size: 12px; color: var(--fg-muted);">
+						{ formatMessageDate(msg.SentAt) }
+					</td>
+					<td style="max-width: 200px;">
+						if msg.FromName != "" {
+							{ msg.FromName }
+						} else {
+							{ msg.FromEmail }
+						}
+					</td>
+					<td style="max-width: 400px;">
+						<a href={ templ.SafeURL(fmt.Sprintf("/messages/%d", msg.ID)) }>
+							if msg.Subject != "" {
+								{ msg.Subject }
+							} else {
+								<em>(no subject)</em>
+							}
+						</a>
+						if msg.HasAttachments {
+							<span style="margin-left: 4px; font-size: 11px; color: var(--fg-muted);">
+								{ fmt.Sprintf("[%d]", msg.AttachmentCount) }
+							</span>
+						}
+					</td>
+					<td class="num">{ formatBytes(msg.SizeEstimate) }</td>
+				</tr>
+			}
+		</tbody>
+	</table>
+}
+
+templ searchPagination(data SearchData) {
+	if data.Page > 1 || data.HasMore {
+		<div style="margin-top: 12px; display: flex; justify-content: center; gap: 4px; align-items: center; font-size: 13px;">
+			if data.Page > 1 {
+				<a
+					href={ templ.SafeURL(data.searchURL(data.Page - 1)) }
+					style="padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
+				>
+					Prev
+				</a>
+			}
+			<span style="padding: 4px 8px; color: var(--fg-muted);">
+				Page { fmt.Sprintf("%d", data.Page) }
+			</span>
+			if data.HasMore {
+				<a
+					href={ templ.SafeURL(data.searchURL(data.Page + 1)) }
+					style="padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
+				>
+					Next
+				</a>
+			}
+		</div>
+	}
+}

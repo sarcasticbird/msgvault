@@ -43,7 +43,7 @@ func (h *Handler) Routes() chi.Router {
 	r.Get("/browse/drill", h.handleDrill)
 	r.Get("/messages", h.handleMessages)
 	r.Get("/messages/{id}", h.handleMessageDetail)
-	r.Get("/search", h.handlePlaceholder("Search", "search"))
+	r.Get("/search", h.handleSearch)
 
 	return r
 }
