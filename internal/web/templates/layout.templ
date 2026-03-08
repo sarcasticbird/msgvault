@@ -18,7 +18,6 @@ templ Layout(title string, activePage string) {
 					<nav class="header-nav">
 						<a href="/" class={ templ.KV("active", activePage == "dashboard") }>Dashboard</a>
 						<a href="/browse" class={ templ.KV("active", activePage == "browse") }>Browse</a>
-						<a href="/messages" class={ templ.KV("active", activePage == "messages") }>Messages</a>
 						<a href="/search" class={ templ.KV("active", activePage == "search") }>Search</a>
 					</nav>
 				</header>

@@ -7,19 +7,32 @@ import (
 )
 
 type SearchData struct {
-	Query    string
-	Mode     string // "fast" or "deep"
-	Messages []query.MessageSummary
-	Page     int
-	PageSize int
-	HasMore  bool
-	Stats    *query.TotalStats
+	Query       string
+	Mode        string // "fast" or "deep"
+	Messages    []query.MessageSummary
+	Page        int
+	PageSize    int
+	HasMore     bool
+	Stats       *query.TotalStats
+	HideDeleted bool
+	Attachments bool
 }
 
-func (d SearchData) searchURL(page int) string {
+func (d SearchData) baseQuery() url.Values {
 	q := url.Values{}
 	q.Set("q", d.Query)
 	q.Set("mode", d.Mode)
+	if d.HideDeleted {
+		q.Set("hide_deleted", "1")
+	}
+	if d.Attachments {
+		q.Set("attachments", "1")
+	}
+	return q
+}
+
+func (d SearchData) searchURL(page int) string {
+	q := d.baseQuery()
 	if page > 1 {
 		q.Set("page", fmt.Sprintf("%d", page))
 	}
@@ -27,21 +40,25 @@ func (d SearchData) searchURL(page int) string {
 }
 
 func (d SearchData) modeToggleURL() string {
-	q := url.Values{}
-	q.Set("q", d.Query)
+	q := d.baseQuery()
 	if d.Mode == "fast" {
 		q.Set("mode", "deep")
 	} else {
 		q.Set("mode", "fast")
 	}
+	q.Del("page")
 	return "/search?" + q.Encode()
 }
 
-func (d SearchData) otherMode() string {
-	if d.Mode == "fast" {
-		return "deep"
+func (d SearchData) filterToggleURL(key string, currentlyOn bool) string {
+	q := d.baseQuery()
+	if currentlyOn {
+		q.Del(key)
+	} else {
+		q.Set(key, "1")
 	}
-	return "fast"
+	q.Del("page")
+	return "/search?" + q.Encode()
 }
 
 templ Search(data SearchData) {
@@ -60,6 +77,12 @@ templ Search(data SearchData) {
 					style="flex: 1; padding: 8px 12px; font-size: 14px; font-family: var(--font); border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--fg); outline: none;"
 				/>
 				<input type="hidden" name="mode" value={ data.Mode }/>
+				if data.HideDeleted {
+					<input type="hidden" name="hide_deleted" value="1"/>
+				}
+				if data.Attachments {
+					<input type="hidden" name="attachments" value="1"/>
+				}
 				<button
 					type="submit"
 					style="padding: 8px 16px; font-size: 14px; font-weight: 600; border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent); color: #fff; cursor: pointer;"
@@ -67,7 +90,7 @@ templ Search(data SearchData) {
 					Search
 				</button>
 			</div>
-			<div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 12px;">
+			<div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px;">
 				if data.Mode == "fast" {
 					<span style="padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; background: var(--accent); color: #fff;">
 						Fast
@@ -89,13 +112,44 @@ templ Search(data SearchData) {
 						Deep
 					</span>
 				}
-				<span style="color: var(--fg-muted);">
+				<span style="color: var(--fg-muted); margin-right: 8px;">
 					if data.Mode == "fast" {
 						Searches subject and sender (faster)
 					} else {
 						Searches full message body (slower)
 					}
 				</span>
+				<span style="border-left: 1px solid var(--border); padding-left: 8px;"></span>
+				if data.HideDeleted {
+					<a
+						href={ templ.SafeURL(data.filterToggleURL("hide_deleted", true)) }
+						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; background: var(--accent); color: #fff; text-decoration: none;"
+					>
+						Hide Deleted
+					</a>
+				} else {
+					<a
+						href={ templ.SafeURL(data.filterToggleURL("hide_deleted", false)) }
+						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
+					>
+						Hide Deleted
+					</a>
+				}
+				if data.Attachments {
+					<a
+						href={ templ.SafeURL(data.filterToggleURL("attachments", true)) }
+						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; background: var(--accent); color: #fff; text-decoration: none;"
+					>
+						Attachments Only
+					</a>
+				} else {
+					<a
+						href={ templ.SafeURL(data.filterToggleURL("attachments", false)) }
+						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
+					>
+						Attachments Only
+					</a>
+				}
 			</div>
 		</form>
 		if data.Query == "" {

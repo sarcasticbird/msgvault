@@ -288,17 +288,34 @@ func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	page := parsePage(r)
 	pageSize := 100
+	hideDeleted := parseBool(r, "hide_deleted")
+	attachments := parseBool(r, "attachments")
 
 	data := templates.SearchData{
-		Query:    queryStr,
-		Mode:     mode,
-		Page:     page,
-		PageSize: pageSize,
+		Query:       queryStr,
+		Mode:        mode,
+		Page:        page,
+		PageSize:    pageSize,
+		HideDeleted: hideDeleted,
+		Attachments: attachments,
 	}
 
 	if queryStr != "" {
 		parsed := search.Parse(queryStr)
+		// Apply hide_deleted from the search parser too
+		if hideDeleted {
+			parsed.HideDeleted = true
+		}
+		if attachments {
+			t := true
+			parsed.HasAttachment = &t
+		}
 		offset := (page - 1) * pageSize
+
+		filter := query.MessageFilter{
+			HideDeletedFromSource: hideDeleted,
+			WithAttachmentsOnly:   attachments,
+		}
 
 		var messages []query.MessageSummary
 		var err error
@@ -307,7 +324,7 @@ func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 			messages, err = h.engine.Search(ctx, parsed, pageSize+1, offset)
 		} else {
 			result, searchErr := h.engine.SearchFastWithStats(
-				ctx, parsed, queryStr, query.MessageFilter{},
+				ctx, parsed, queryStr, filter,
 				query.ViewSenders, pageSize+1, offset,
 			)
 			if searchErr == nil {
@@ -332,7 +349,10 @@ func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	// Ensure stats bar is always shown (deep search doesn't return stats)
 	if data.Stats == nil {
-		stats, statsErr := h.engine.GetTotalStats(ctx, query.StatsOptions{})
+		stats, statsErr := h.engine.GetTotalStats(ctx, query.StatsOptions{
+			HideDeletedFromSource: hideDeleted,
+			WithAttachmentsOnly:   attachments,
+		})
 		if statsErr != nil {
 			slog.Error("failed to get stats for search page", "error", statsErr)
 		} else {
