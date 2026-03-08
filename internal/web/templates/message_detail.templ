@@ -1,0 +1,133 @@
+package templates
+
+import (
+	"fmt"
+	"strings"
+	"github.com/wesm/msgvault/internal/query"
+)
+
+type MessageDetailData struct {
+	Message *query.MessageDetail
+	// Navigation context for back link
+	BackURL string
+}
+
+func formatAddress(a query.Address) string {
+	if a.Name != "" {
+		return a.Name + " <" + a.Email + ">"
+	}
+	return a.Email
+}
+
+func formatAddressList(addrs []query.Address) string {
+	parts := make([]string, len(addrs))
+	for i, a := range addrs {
+		parts[i] = formatAddress(a)
+	}
+	return strings.Join(parts, ", ")
+}
+
+templ MessageDetailPage(data MessageDetailData) {
+	@Layout("Message", "messages") {
+		if data.Message == nil {
+			<div class="empty-state">
+				<div class="empty-state-title">Message not found</div>
+				<p>The requested message could not be loaded.</p>
+			</div>
+		} else {
+			<nav style="margin-bottom: 16px; font-size: 13px;">
+				<a href={ templ.SafeURL(data.BackURL) }>&larr; Back to messages</a>
+			</nav>
+			@messageHeader(data.Message)
+			@messageBody(data.Message)
+		}
+	}
+}
+
+templ messageHeader(msg *query.MessageDetail) {
+	<div class="card" style="margin-bottom: 16px;">
+		<h2 style="font-size: 18px; font-weight: 600; margin-bottom: 12px; line-height: 1.3;">
+			if msg.Subject != "" {
+				{ msg.Subject }
+			} else {
+				<em style="color: var(--fg-muted);">(no subject)</em>
+			}
+		</h2>
+		<table style="font-size: 13px; border-collapse: collapse;">
+			<tbody>
+				<tr>
+					<td style="padding: 2px 12px 2px 0; color: var(--fg-muted); white-space: nowrap; vertical-align: top;">Date</td>
+					<td style="padding: 2px 0;">{ msg.SentAt.Format("Mon, 02 Jan 2006 15:04:05 MST") }</td>
+				</tr>
+				if len(msg.From) > 0 {
+					<tr>
+						<td style="padding: 2px 12px 2px 0; color: var(--fg-muted); white-space: nowrap; vertical-align: top;">From</td>
+						<td style="padding: 2px 0;">{ formatAddressList(msg.From) }</td>
+					</tr>
+				}
+				if len(msg.To) > 0 {
+					<tr>
+						<td style="padding: 2px 12px 2px 0; color: var(--fg-muted); white-space: nowrap; vertical-align: top;">To</td>
+						<td style="padding: 2px 0;">{ formatAddressList(msg.To) }</td>
+					</tr>
+				}
+				if len(msg.Cc) > 0 {
+					<tr>
+						<td style="padding: 2px 12px 2px 0; color: var(--fg-muted); white-space: nowrap; vertical-align: top;">Cc</td>
+						<td style="padding: 2px 0;">{ formatAddressList(msg.Cc) }</td>
+					</tr>
+				}
+				if len(msg.Bcc) > 0 {
+					<tr>
+						<td style="padding: 2px 12px 2px 0; color: var(--fg-muted); white-space: nowrap; vertical-align: top;">Bcc</td>
+						<td style="padding: 2px 0;">{ formatAddressList(msg.Bcc) }</td>
+					</tr>
+				}
+				if len(msg.Labels) > 0 {
+					<tr>
+						<td style="padding: 2px 12px 2px 0; color: var(--fg-muted); white-space: nowrap; vertical-align: top;">Labels</td>
+						<td style="padding: 2px 0;">
+							for _, label := range msg.Labels {
+								<span style="display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; background: var(--bg-alt); border: 1px solid var(--border); margin-right: 4px;">
+									{ label }
+								</span>
+							}
+						</td>
+					</tr>
+				}
+			</tbody>
+		</table>
+		if len(msg.Attachments) > 0 {
+			<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+				<div style="font-size: 12px; color: var(--fg-muted); font-weight: 600; margin-bottom: 6px;">
+					Attachments ({ fmt.Sprintf("%d", len(msg.Attachments)) })
+				</div>
+				for _, att := range msg.Attachments {
+					<div style="font-size: 13px; padding: 2px 0;">
+						<span style="color: var(--fg-muted);">{ att.Filename }</span>
+						<span style="font-size: 11px; color: var(--fg-muted); margin-left: 4px;">({ formatBytes(att.Size) })</span>
+					</div>
+				}
+			</div>
+		}
+		if msg.ConversationID > 0 {
+			<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 12px;">
+				<a href={ templ.SafeURL(fmt.Sprintf("/messages?conversation=%d", msg.ConversationID)) }>
+					View thread
+				</a>
+			</div>
+		}
+	</div>
+}
+
+templ messageBody(msg *query.MessageDetail) {
+	<div class="card">
+		if msg.BodyText != "" {
+			<pre style="white-space: pre-wrap; word-wrap: break-word; font-family: var(--font); font-size: 13px; line-height: 1.6; margin: 0;">{ msg.BodyText }</pre>
+		} else if msg.BodyHTML != "" {
+			<pre style="white-space: pre-wrap; word-wrap: break-word; font-family: var(--font); font-size: 13px; line-height: 1.6; margin: 0;">{ htmlToPlainText(msg.BodyHTML) }</pre>
+		} else {
+			<p style="color: var(--fg-muted); font-style: italic;">(No message content)</p>
+		}
+	</div>
+}

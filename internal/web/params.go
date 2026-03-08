@@ -147,6 +147,99 @@ func parseAggregateOptions(r *http.Request) query.AggregateOptions {
 	return opts
 }
 
+func parseMessageSortField(r *http.Request) query.MessageSortField {
+	switch r.URL.Query().Get("sort") {
+	case "date":
+		return query.MessageSortByDate
+	case "size":
+		return query.MessageSortBySize
+	case "subject":
+		return query.MessageSortBySubject
+	default:
+		return query.MessageSortByDate
+	}
+}
+
+func messageSortFieldToString(f query.MessageSortField) string {
+	switch f {
+	case query.MessageSortByDate:
+		return "date"
+	case query.MessageSortBySize:
+		return "size"
+	case query.MessageSortBySubject:
+		return "subject"
+	default:
+		return "date"
+	}
+}
+
+func parsePage(r *http.Request) int {
+	s := r.URL.Query().Get("page")
+	if s == "" {
+		return 1
+	}
+	p, err := strconv.Atoi(s)
+	if err != nil || p < 1 {
+		return 1
+	}
+	return p
+}
+
+func parseMessageFilter(r *http.Request) query.MessageFilter {
+	q := r.URL.Query()
+	f := query.MessageFilter{
+		Sender:                q.Get("sender"),
+		SenderName:            q.Get("sender_name"),
+		Recipient:             q.Get("recipient"),
+		RecipientName:         q.Get("recipient_name"),
+		Domain:                q.Get("domain"),
+		Label:                 q.Get("label"),
+		SourceID:              parseOptionalInt64(r, "account"),
+		WithAttachmentsOnly:   parseBool(r, "attachments"),
+		HideDeletedFromSource: parseBool(r, "hide_deleted"),
+		Sorting: query.MessageSorting{
+			Field:     parseMessageSortField(r),
+			Direction: parseSortDirection(r),
+		},
+	}
+
+	// Handle empty-key filters
+	emptyTargets := map[string]query.ViewType{
+		"sender":         query.ViewSenders,
+		"sender_name":    query.ViewSenderNames,
+		"recipient":      query.ViewRecipients,
+		"recipient_name": query.ViewRecipientNames,
+		"domain":         query.ViewDomains,
+		"label":          query.ViewLabels,
+	}
+	for param, viewType := range emptyTargets {
+		if _, ok := q[param]; ok && q.Get(param) == "" {
+			f.SetEmptyTarget(viewType)
+		}
+	}
+
+	timePeriod := q.Get("time_period")
+	if timePeriod != "" {
+		f.TimeRange = query.TimeRange{
+			Period:      timePeriod,
+			Granularity: parseTimeGranularity(r),
+		}
+	}
+
+	convID := parseOptionalInt64(r, "conversation")
+	if convID != nil {
+		f.ConversationID = convID
+	}
+
+	page := parsePage(r)
+	f.Pagination = query.Pagination{
+		Limit:  100,
+		Offset: (page - 1) * 100,
+	}
+
+	return f
+}
+
 func parseDrillFilter(r *http.Request) query.MessageFilter {
 	q := r.URL.Query()
 	f := query.MessageFilter{

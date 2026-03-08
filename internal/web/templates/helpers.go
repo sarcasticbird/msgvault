@@ -2,8 +2,11 @@ package templates
 
 import (
 	"fmt"
+	"html"
 	"net/url"
+	"regexp"
 	"strings"
+	"time"
 )
 
 // formatBytes formats a byte count into a human-readable string.
@@ -70,4 +73,23 @@ func deleteParam(base, key string) string {
 	q.Del(key)
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// formatMessageDate formats a time for the message list.
+func formatMessageDate(t time.Time) string {
+	now := time.Now()
+	if t.Year() == now.Year() {
+		return t.Format("Jan 02 15:04")
+	}
+	return t.Format("Jan 02, 2006")
+}
+
+// htmlTagRe matches HTML tags for stripping.
+var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+
+// htmlToPlainText strips all HTML tags and returns plain text.
+// Used to extract readable content from HTML email bodies.
+func htmlToPlainText(s string) string {
+	text := htmlTagRe.ReplaceAllString(s, "")
+	return html.UnescapeString(text)
 }
