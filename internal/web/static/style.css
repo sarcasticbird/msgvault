@@ -394,7 +394,20 @@ a:hover { color: var(--accent-hover); text-decoration: underline; }
   gap: 8px;
 }
 .toolbar-left { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.toolbar-right { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+.toolbar-right { display: flex; gap: 8px; align-items: center; font-size: 12px; flex-wrap: wrap; }
+.account-select {
+  padding: 3px 8px;
+  font-size: 12px;
+  font-family: var(--font);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  outline: none;
+}
+.account-select:hover { border-color: var(--fg-muted); }
+.account-select:focus { border-color: var(--accent); }
 
 /* Message detail */
 .msg-subject {

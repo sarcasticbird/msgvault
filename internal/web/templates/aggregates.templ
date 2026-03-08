@@ -18,6 +18,7 @@ type BrowseData struct {
 	AccountID   string
 	Attachments bool
 	HideDeleted bool
+	Accounts    []query.AccountInfo
 	// Drill-down context
 	DrillFilters map[string]string
 	Breadcrumbs  []Breadcrumb
@@ -190,6 +191,17 @@ func (d BrowseData) filterToggleURL(key string, currentlyOn bool) string {
 	return addParam(base, key, "1")
 }
 
+// accountFilterURL returns the URL for filtering by a specific account (or all).
+func (d BrowseData) accountFilterURL(accountID string) string {
+	base := d.currentBase()
+	if accountID == "" {
+		return deleteParam(base, "account")
+	}
+	// Replace any existing account param
+	base = deleteParam(base, "account")
+	return addParam(base, "account", accountID)
+}
+
 func viewTypeToFilterParam(viewType string) string {
 	switch viewType {
 	case "senders":
@@ -350,6 +362,9 @@ templ granularityTab(label string, granularity string, data BrowseData) {
 
 templ filterControls(data BrowseData) {
 	<div class="toolbar-right">
+		if len(data.Accounts) > 0 {
+			@accountSelector(data)
+		}
 		if data.Attachments {
 			<a href={ templ.SafeURL(data.filterToggleURL("attachments", true)) } class="pill-sm active">Attachments Only</a>
 		} else {
@@ -361,4 +376,17 @@ templ filterControls(data BrowseData) {
 			<a href={ templ.SafeURL(data.filterToggleURL("hide_deleted", false)) } class="pill-sm">Hide Deleted</a>
 		}
 	</div>
+}
+
+templ accountSelector(data BrowseData) {
+	<select class="account-select" onchange="window.location=this.value">
+		<option value={ data.accountFilterURL("") } if data.AccountID == "" {
+			selected
+		}>All accounts</option>
+		for _, acct := range data.Accounts {
+			<option value={ data.accountFilterURL(fmt.Sprintf("%d", acct.ID)) } if data.AccountID == fmt.Sprintf("%d", acct.ID) {
+				selected
+			}>{ acct.Identifier }</option>
+		}
+	</select>
 }

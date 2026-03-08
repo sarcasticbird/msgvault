@@ -67,6 +67,11 @@ func (h *Handler) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to get stats", "error", err)
 	}
 
+	accounts, err := h.engine.ListAccounts(ctx)
+	if err != nil {
+		slog.Error("failed to list accounts", "error", err)
+	}
+
 	data := templates.BrowseData{
 		Stats:       stats,
 		Rows:        rows,
@@ -78,6 +83,7 @@ func (h *Handler) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		AccountID:   r.URL.Query().Get("account"),
 		Attachments: opts.WithAttachmentsOnly,
 		HideDeleted: opts.HideDeletedFromSource,
+		Accounts:    accounts,
 	}
 
 	var buf bytes.Buffer
@@ -144,6 +150,11 @@ func (h *Handler) handleDrill(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	accounts, err := h.engine.ListAccounts(ctx)
+	if err != nil {
+		slog.Error("failed to list accounts", "error", err)
+	}
+
 	data := templates.BrowseData{
 		Stats:        stats,
 		Rows:         rows,
@@ -155,6 +166,7 @@ func (h *Handler) handleDrill(w http.ResponseWriter, r *http.Request) {
 		AccountID:    r.URL.Query().Get("account"),
 		Attachments:  opts.WithAttachmentsOnly,
 		HideDeleted:  opts.HideDeletedFromSource,
+		Accounts:     accounts,
 		DrillFilters: drillFilters,
 		Breadcrumbs:  breadcrumbs,
 	}

@@ -155,6 +155,15 @@
         window.location.href = '/browse';
         break;
 
+      case 'Backspace':
+        // Navigate back via breadcrumb link
+        e.preventDefault();
+        var backLink = document.querySelector('.breadcrumb a');
+        if (backLink) {
+          backLink.click();
+        }
+        break;
+
       case 'n':
         // Next page
         var nextLink = document.querySelector('.pagination a:last-of-type');
