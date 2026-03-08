@@ -28,11 +28,13 @@
     rows[activeRow].scrollIntoView({ block: 'nearest' });
   }
 
-  function openActiveRow() {
+  function openActiveRow(linkIndex) {
     var rows = getRows();
     if (activeRow < 0 || activeRow >= rows.length) return;
-    var link = rows[activeRow].querySelector('a');
-    if (link) link.click();
+    var links = rows[activeRow].querySelectorAll('a');
+    if (links.length === 0) return;
+    var idx = (linkIndex !== undefined && linkIndex < links.length) ? linkIndex : 0;
+    links[idx].click();
   }
 
   function isInputFocused() {
@@ -119,7 +121,15 @@
       case 'Enter':
         if (activeRow >= 0) {
           e.preventDefault();
-          openActiveRow();
+          openActiveRow(0);
+        }
+        break;
+
+      case 'o':
+        // Open messages for active row (second link, or first if only one)
+        if (activeRow >= 0) {
+          e.preventDefault();
+          openActiveRow(1);
         }
         break;
 
