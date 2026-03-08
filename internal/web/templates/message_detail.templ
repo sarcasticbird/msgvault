@@ -102,7 +102,13 @@ templ messageHeader(msg *query.MessageDetail) {
 				</div>
 				for _, att := range msg.Attachments {
 					<div class="msg-attachment">
-						{ att.Filename }
+						if att.ContentHash != "" {
+							<a href={ templ.SafeURL(fmt.Sprintf("/attachments/%d/download", att.ID)) } class="msg-attachment-link">
+								{ att.Filename }
+							</a>
+						} else {
+							{ att.Filename }
+						}
 						<span class="msg-attachment-size">({ formatBytes(att.Size) })</span>
 					</div>
 				}

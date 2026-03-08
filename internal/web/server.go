@@ -17,18 +17,19 @@ var staticFS embed.FS
 
 // Handler serves the web UI.
 type Handler struct {
-	engine    query.Engine
-	deletions *deletion.Manager
-	staticFS  fs.FS
+	engine         query.Engine
+	deletions      *deletion.Manager
+	staticFS       fs.FS
+	attachmentsDir string
 }
 
 // NewHandler creates a new web UI handler.
-func NewHandler(engine query.Engine, deletions *deletion.Manager) *Handler {
+func NewHandler(engine query.Engine, deletions *deletion.Manager, attachmentsDir string) *Handler {
 	staticSub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		panic(fmt.Sprintf("web: failed to sub static FS: %v", err))
 	}
-	return &Handler{engine: engine, deletions: deletions, staticFS: staticSub}
+	return &Handler{engine: engine, deletions: deletions, staticFS: staticSub, attachmentsDir: attachmentsDir}
 }
 
 // Routes returns a chi.Router with all web UI routes mounted.
@@ -45,6 +46,7 @@ func (h *Handler) Routes() chi.Router {
 	r.Get("/browse/drill", h.handleDrill)
 	r.Get("/messages", h.handleMessages)
 	r.Get("/messages/{id}", h.handleMessageDetail)
+	r.Get("/attachments/{id}/download", h.handleAttachmentDownload)
 	r.Get("/search", h.handleSearch)
 
 	// Deletion staging

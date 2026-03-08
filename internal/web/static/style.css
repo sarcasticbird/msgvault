@@ -628,6 +628,40 @@ a:hover { color: var(--accent-hover); text-decoration: underline; }
   display: flex;
 }
 
+/* Flash notices */
+.flash-notice {
+  padding: 8px 16px;
+  margin-bottom: 16px;
+  background: rgba(42, 161, 152, 0.12);
+  border: 1px solid #2aa198;
+  border-radius: var(--radius);
+  color: var(--fg);
+  font-size: 13px;
+}
+
+/* Message navigation (prev/next) */
+.msg-nav {
+  float: right;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.msg-nav-link {
+  font-size: 13px;
+}
+.msg-nav-pos {
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+/* Attachment download links */
+.msg-attachment-link {
+  color: var(--accent);
+}
+.msg-attachment-link:hover {
+  color: var(--accent-hover);
+}
+
 /* Footer */
 .footer {
   padding: 16px 0;

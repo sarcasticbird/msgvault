@@ -5,7 +5,6 @@ import (
 	"html"
 	"net/url"
 	"regexp"
-	"strings"
 	"time"
 )
 
@@ -56,11 +55,14 @@ func addParam(base, key, value string) string {
 	if value == "" {
 		return base
 	}
-	sep := "&"
-	if !strings.Contains(base, "?") {
-		sep = "?"
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
 	}
-	return base + sep + url.QueryEscape(key) + "=" + url.QueryEscape(value)
+	q := u.Query()
+	q.Set(key, value)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // deleteParam removes a query parameter from a URL string.

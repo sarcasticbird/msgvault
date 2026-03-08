@@ -28,11 +28,16 @@ func (h *Handler) handleDeletions(w http.ResponseWriter, r *http.Request) {
 	completed, _ := h.deletions.ListCompleted()
 	failed, _ := h.deletions.ListFailed()
 
+	flash := r.URL.Query().Get("flash")
+	flashCount, _ := strconv.Atoi(r.URL.Query().Get("count"))
+
 	data := templates.DeletionsData{
 		Pending:    pending,
 		InProgress: inProgress,
 		Completed:  completed,
 		Failed:     failed,
+		Flash:      flash,
+		FlashCount: flashCount,
 	}
 
 	var buf bytes.Buffer
@@ -53,6 +58,8 @@ func (h *Handler) handleStageBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Limit form body size before parsing to prevent memory exhaustion.
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20) // 2 MB
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Invalid form data", http.StatusBadRequest)
 		return
@@ -63,6 +70,12 @@ func (h *Handler) handleStageBatch(w http.ResponseWriter, r *http.Request) {
 	gmailIDs := r.Form["gmail_id"]
 	if len(gmailIDs) == 0 {
 		http.Redirect(w, r, "/messages", http.StatusSeeOther)
+		return
+	}
+
+	const maxBatchSize = 10000
+	if len(gmailIDs) > maxBatchSize {
+		http.Error(w, fmt.Sprintf("Too many messages (max %d)", maxBatchSize), http.StatusBadRequest)
 		return
 	}
 
@@ -86,7 +99,7 @@ func (h *Handler) handleStageBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, "/deletions", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/deletions?flash=staged&count=%d", len(gmailIDs)), http.StatusSeeOther)
 }
 
 // handleStageMessage stages a single message for deletion by its database ID.
@@ -108,6 +121,10 @@ func (h *Handler) handleStageMessage(w http.ResponseWriter, r *http.Request) {
 	msg, err := h.engine.GetMessage(ctx, msgID)
 	if err != nil {
 		slog.Error("failed to load message for deletion", "error", err, "id", msgID)
+		http.Error(w, "Failed to load message", http.StatusInternalServerError)
+		return
+	}
+	if msg == nil {
 		http.Error(w, "Message not found", http.StatusNotFound)
 		return
 	}
@@ -132,7 +149,7 @@ func (h *Handler) handleStageMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, "/deletions", http.StatusSeeOther)
+	http.Redirect(w, r, "/deletions?flash=staged&count=1", http.StatusSeeOther)
 }
 
 func (h *Handler) handleCancelDeletion(w http.ResponseWriter, r *http.Request) {

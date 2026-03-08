@@ -187,62 +187,9 @@ func parsePage(r *http.Request) int {
 	return p
 }
 
-func parseMessageFilter(r *http.Request) query.MessageFilter {
-	q := r.URL.Query()
-	f := query.MessageFilter{
-		Sender:                q.Get("sender"),
-		SenderName:            q.Get("sender_name"),
-		Recipient:             q.Get("recipient"),
-		RecipientName:         q.Get("recipient_name"),
-		Domain:                q.Get("domain"),
-		Label:                 q.Get("label"),
-		SourceID:              parseOptionalInt64(r, "account"),
-		WithAttachmentsOnly:   parseBool(r, "attachments"),
-		HideDeletedFromSource: parseBool(r, "hide_deleted"),
-		Sorting: query.MessageSorting{
-			Field:     parseMessageSortField(r),
-			Direction: parseSortDirection(r),
-		},
-	}
-
-	// Handle empty-key filters
-	emptyTargets := map[string]query.ViewType{
-		"sender":         query.ViewSenders,
-		"sender_name":    query.ViewSenderNames,
-		"recipient":      query.ViewRecipients,
-		"recipient_name": query.ViewRecipientNames,
-		"domain":         query.ViewDomains,
-		"label":          query.ViewLabels,
-	}
-	for param, viewType := range emptyTargets {
-		if _, ok := q[param]; ok && q.Get(param) == "" {
-			f.SetEmptyTarget(viewType)
-		}
-	}
-
-	timePeriod := q.Get("time_period")
-	if timePeriod != "" {
-		f.TimeRange = query.TimeRange{
-			Period:      timePeriod,
-			Granularity: parseTimeGranularity(r),
-		}
-	}
-
-	convID := parseOptionalInt64(r, "conversation")
-	if convID != nil {
-		f.ConversationID = convID
-	}
-
-	page := parsePage(r)
-	f.Pagination = query.Pagination{
-		Limit:  defaultPageSize,
-		Offset: (page - 1) * defaultPageSize,
-	}
-
-	return f
-}
-
-func parseDrillFilter(r *http.Request) query.MessageFilter {
+// parseBaseMessageFilter extracts the shared filter fields from a request.
+// Used by parseMessageFilter, parseDrillFilter, and search handlers.
+func parseBaseMessageFilter(r *http.Request) query.MessageFilter {
 	q := r.URL.Query()
 	f := query.MessageFilter{
 		Sender:                q.Get("sender"),
@@ -256,7 +203,7 @@ func parseDrillFilter(r *http.Request) query.MessageFilter {
 		HideDeletedFromSource: parseBool(r, "hide_deleted"),
 	}
 
-	// Handle empty-key drill-down: when a filter param is present but empty,
+	// Handle empty-key filters: when a filter param is present but empty,
 	// set EmptyValueTargets so the query engine filters for NULL/empty values.
 	emptyTargets := map[string]query.ViewType{
 		"sender":         query.ViewSenders,
@@ -279,5 +226,31 @@ func parseDrillFilter(r *http.Request) query.MessageFilter {
 			Granularity: parseTimeGranularity(r),
 		}
 	}
+
 	return f
+}
+
+func parseMessageFilter(r *http.Request) query.MessageFilter {
+	f := parseBaseMessageFilter(r)
+	f.Sorting = query.MessageSorting{
+		Field:     parseMessageSortField(r),
+		Direction: parseSortDirection(r),
+	}
+
+	convID := parseOptionalInt64(r, "conversation")
+	if convID != nil {
+		f.ConversationID = convID
+	}
+
+	page := parsePage(r)
+	f.Pagination = query.Pagination{
+		Limit:  defaultPageSize,
+		Offset: (page - 1) * defaultPageSize,
+	}
+
+	return f
+}
+
+func parseDrillFilter(r *http.Request) query.MessageFilter {
+	return parseBaseMessageFilter(r)
 }

@@ -67,6 +67,64 @@
     });
   }
 
+  // Store message IDs for prev/next navigation
+  function storeMessageList() {
+    var rows = getRows();
+    var ids = [];
+    for (var i = 0; i < rows.length; i++) {
+      var link = rows[i].querySelector('a[href^="/messages/"]');
+      if (link) {
+        var match = link.getAttribute('href').match(/\/messages\/(\d+)/);
+        if (match) ids.push(match[1]);
+      }
+    }
+    if (ids.length > 0) {
+      sessionStorage.setItem('msgvault-msg-list', JSON.stringify(ids));
+    }
+  }
+
+  // On message detail page, add prev/next navigation links
+  function setupMessageNav() {
+    var path = window.location.pathname;
+    var match = path.match(/^\/messages\/(\d+)$/);
+    if (!match) return;
+
+    var currentId = match[1];
+    var ids = JSON.parse(sessionStorage.getItem('msgvault-msg-list') || '[]');
+    var idx = ids.indexOf(currentId);
+    if (idx < 0) return;
+
+    var nav = document.querySelector('.breadcrumb');
+    if (!nav) return;
+
+    var navSpan = document.createElement('span');
+    navSpan.className = 'msg-nav';
+    if (idx > 0) {
+      var prev = document.createElement('a');
+      prev.href = '/messages/' + ids[idx - 1];
+      prev.innerHTML = '&larr; Prev';
+      prev.className = 'msg-nav-link';
+      prev.id = 'msg-prev';
+      navSpan.appendChild(prev);
+    }
+    if (idx < ids.length - 1) {
+      var next = document.createElement('a');
+      next.href = '/messages/' + ids[idx + 1];
+      next.innerHTML = 'Next &rarr;';
+      next.className = 'msg-nav-link';
+      next.id = 'msg-next';
+      navSpan.appendChild(next);
+    }
+    if (navSpan.children.length > 0) {
+      // Add position indicator
+      var pos = document.createElement('span');
+      pos.className = 'msg-nav-pos';
+      pos.textContent = (idx + 1) + ' / ' + ids.length;
+      navSpan.appendChild(pos);
+      nav.appendChild(navSpan);
+    }
+  }
+
   document.addEventListener('keydown', function (e) {
     // Always allow Escape to close help / exit delete mode
     if (e.key === 'Escape') {
@@ -139,7 +197,7 @@
         break;
 
       case 'g':
-        // gg = go to top (first row)
+        // Go to first row
         e.preventDefault();
         setActive(0);
         break;
@@ -183,6 +241,18 @@
         if (prevLink && prevLink.textContent.trim() === 'Prev') {
           prevLink.click();
         }
+        break;
+
+      case 'ArrowLeft':
+        // Previous message (detail view)
+        var prevMsg = document.getElementById('msg-prev');
+        if (prevMsg) { prevMsg.click(); e.preventDefault(); }
+        break;
+
+      case 'ArrowRight':
+        // Next message (detail view)
+        var nextMsg = document.getElementById('msg-next');
+        if (nextMsg) { nextMsg.click(); e.preventDefault(); }
         break;
 
       case 'd':
@@ -338,9 +408,24 @@
     }
   }
 
+  // Auto-dismiss flash notices
+  function setupFlashDismiss() {
+    var flash = document.querySelector('.flash-notice');
+    if (flash) {
+      setTimeout(function () {
+        flash.style.transition = 'opacity 0.3s';
+        flash.style.opacity = '0';
+        setTimeout(function () { flash.remove(); }, 300);
+      }, 4000);
+    }
+  }
+
   // Reset active row on page load
   activeRow = -1;
   setupSearchLoading();
   setupThemeToggle();
   setupSelection();
+  storeMessageList();
+  setupMessageNav();
+  setupFlashDismiss();
 })();
