@@ -42,7 +42,7 @@ func Layout(title string, activePage string) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 2, " - msgvault</title><link rel=\"stylesheet\" href=\"/static/style.css\"><!-- htmx 2.0.4 - vendored from https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js --><script src=\"/static/htmx.min.js\"></script></head><body><div class=\"app\"><header class=\"header\"><span class=\"header-title\">msgvault</span><nav class=\"header-nav\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 2, " - msgvault</title><link rel=\"stylesheet\" href=\"/static/style.css\"></head><body><div class=\"app\"><header class=\"header\"><span class=\"header-title\">msgvault</span><nav class=\"header-nav\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

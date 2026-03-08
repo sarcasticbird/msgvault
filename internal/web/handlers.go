@@ -6,25 +6,13 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/wesm/msgvault/internal/query"
 	"github.com/wesm/msgvault/internal/search"
 	"github.com/wesm/msgvault/internal/web/templates"
 )
-
-func (h *Handler) handlePlaceholder(title, page string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var buf bytes.Buffer
-		if err := templates.Placeholder(title, page).Render(r.Context(), &buf); err != nil {
-			slog.Error("failed to render placeholder", "error", err)
-			http.Error(w, "Failed to render page", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = buf.WriteTo(w)
-	}
-}
 
 func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -254,13 +242,17 @@ func (h *Handler) handleMessageDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build back URL from referer, restricted to same-origin paths only
+	// Build back URL from referer, restricted to same-origin paths only.
+	// Only allow relative paths (starting with /) or same-host URLs to prevent
+	// javascript: URI injection via templ.SafeURL.
 	backURL := "/messages"
 	if ref := r.Header.Get("Referer"); ref != "" {
-		if u, err := url.Parse(ref); err == nil && u.Host == "" {
-			backURL = ref
-		} else if err == nil && u.Host == r.Host {
-			backURL = u.RequestURI()
+		if u, err := url.Parse(ref); err == nil {
+			if u.Scheme == "" && u.Host == "" && strings.HasPrefix(u.Path, "/") {
+				backURL = u.RequestURI()
+			} else if u.Host == r.Host && (u.Scheme == "http" || u.Scheme == "https") {
+				backURL = u.RequestURI()
+			}
 		}
 	}
 
@@ -287,7 +279,7 @@ func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 		mode = "fast"
 	}
 	page := parsePage(r)
-	pageSize := 100
+	pageSize := defaultPageSize
 	hideDeleted := parseBool(r, "hide_deleted")
 	attachments := parseBool(r, "attachments")
 

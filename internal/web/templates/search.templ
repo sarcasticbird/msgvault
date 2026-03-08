@@ -66,15 +66,16 @@ templ Search(data SearchData) {
 		if data.Stats != nil {
 			@StatsBar(data.Stats)
 		}
-		<form action="/search" method="get" style="margin-bottom: 16px;">
-			<div style="display: flex; gap: 8px; align-items: stretch;">
+		<form action="/search" method="get" class="search-form">
+			<div class="search-row">
 				<input
 					type="text"
 					name="q"
 					value={ data.Query }
 					placeholder="Search messages... (e.g. from:user@example.com invoice)"
+					aria-label="Search messages"
 					autofocus
-					style="flex: 1; padding: 8px 12px; font-size: 14px; font-family: var(--font); border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--fg); outline: none;"
+					class="search-input"
 				/>
 				<input type="hidden" name="mode" value={ data.Mode }/>
 				if data.HideDeleted {
@@ -83,70 +84,41 @@ templ Search(data SearchData) {
 				if data.Attachments {
 					<input type="hidden" name="attachments" value="1"/>
 				}
-				<button
-					type="submit"
-					style="padding: 8px 16px; font-size: 14px; font-weight: 600; border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent); color: #fff; cursor: pointer;"
-				>
+				<button type="submit" class="search-btn">
 					Search
 				</button>
 			</div>
-			<div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px;">
+			<div class="search-controls">
 				if data.Mode == "fast" {
-					<span style="padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; background: var(--accent); color: #fff;">
-						Fast
-					</span>
-					<a
-						href={ templ.SafeURL(data.modeToggleURL()) }
-						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-					>
-						Deep
-					</a>
+					<span class="pill-sm active">Fast</span>
+					<a href={ templ.SafeURL(data.modeToggleURL()) } class="pill-sm">Deep</a>
 				} else {
-					<a
-						href={ templ.SafeURL(data.modeToggleURL()) }
-						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-					>
-						Fast
-					</a>
-					<span style="padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; background: var(--accent); color: #fff;">
-						Deep
-					</span>
+					<a href={ templ.SafeURL(data.modeToggleURL()) } class="pill-sm">Fast</a>
+					<span class="pill-sm active">Deep</span>
 				}
-				<span style="color: var(--fg-muted); margin-right: 8px;">
+				<span class="search-hint">
 					if data.Mode == "fast" {
 						Searches subject and sender (faster)
 					} else {
 						Searches full message body (slower)
 					}
 				</span>
-				<span style="border-left: 1px solid var(--border); padding-left: 8px;"></span>
+				<span class="search-divider"></span>
 				if data.HideDeleted {
-					<a
-						href={ templ.SafeURL(data.filterToggleURL("hide_deleted", true)) }
-						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; background: var(--accent); color: #fff; text-decoration: none;"
-					>
+					<a href={ templ.SafeURL(data.filterToggleURL("hide_deleted", true)) } class="pill-sm active">
 						Hide Deleted
 					</a>
 				} else {
-					<a
-						href={ templ.SafeURL(data.filterToggleURL("hide_deleted", false)) }
-						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-					>
+					<a href={ templ.SafeURL(data.filterToggleURL("hide_deleted", false)) } class="pill-sm">
 						Hide Deleted
 					</a>
 				}
 				if data.Attachments {
-					<a
-						href={ templ.SafeURL(data.filterToggleURL("attachments", true)) }
-						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; background: var(--accent); color: #fff; text-decoration: none;"
-					>
+					<a href={ templ.SafeURL(data.filterToggleURL("attachments", true)) } class="pill-sm active">
 						Attachments Only
 					</a>
 				} else {
-					<a
-						href={ templ.SafeURL(data.filterToggleURL("attachments", false)) }
-						style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-					>
+					<a href={ templ.SafeURL(data.filterToggleURL("attachments", false)) } class="pill-sm">
 						Attachments Only
 					</a>
 				}
@@ -168,83 +140,29 @@ templ Search(data SearchData) {
 				</p>
 			</div>
 		} else {
-			<div style="margin-bottom: 8px; font-size: 12px; color: var(--fg-muted);">
+			<div class="result-count">
 				Showing { formatCount(int64(len(data.Messages))) } results
 				if data.Page > 1 {
 					(page { fmt.Sprintf("%d", data.Page) })
 				}
 			</div>
-			@searchResultsTable(data)
+			@messageListTable(data.Messages)
 			@searchPagination(data)
 		}
 	}
 }
 
-templ searchResultsTable(data SearchData) {
-	<table class="data-table">
-		<thead>
-			<tr>
-				<th>Date</th>
-				<th>From</th>
-				<th>Subject</th>
-				<th class="num">Size</th>
-			</tr>
-		</thead>
-		<tbody>
-			for _, msg := range data.Messages {
-				<tr>
-					<td style="white-space: nowrap; font-size: 12px; color: var(--fg-muted);">
-						{ formatMessageDate(msg.SentAt) }
-					</td>
-					<td style="max-width: 200px;">
-						if msg.FromName != "" {
-							{ msg.FromName }
-						} else {
-							{ msg.FromEmail }
-						}
-					</td>
-					<td style="max-width: 400px;">
-						<a href={ templ.SafeURL(fmt.Sprintf("/messages/%d", msg.ID)) }>
-							if msg.Subject != "" {
-								{ msg.Subject }
-							} else {
-								<em>(no subject)</em>
-							}
-						</a>
-						if msg.HasAttachments {
-							<span style="margin-left: 4px; font-size: 11px; color: var(--fg-muted);">
-								{ fmt.Sprintf("[%d]", msg.AttachmentCount) }
-							</span>
-						}
-					</td>
-					<td class="num">{ formatBytes(msg.SizeEstimate) }</td>
-				</tr>
-			}
-		</tbody>
-	</table>
-}
-
 templ searchPagination(data SearchData) {
 	if data.Page > 1 || data.HasMore {
-		<div style="margin-top: 12px; display: flex; justify-content: center; gap: 4px; align-items: center; font-size: 13px;">
+		<div class="pagination">
 			if data.Page > 1 {
-				<a
-					href={ templ.SafeURL(data.searchURL(data.Page - 1)) }
-					style="padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-				>
-					Prev
-				</a>
+				<a href={ templ.SafeURL(data.searchURL(data.Page - 1)) }>Prev</a>
 			}
-			<span style="padding: 4px 8px; color: var(--fg-muted);">
+			<span class="page-info">
 				Page { fmt.Sprintf("%d", data.Page) }
 			</span>
 			if data.HasMore {
-				<a
-					href={ templ.SafeURL(data.searchURL(data.Page + 1)) }
-					style="padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-				>
-					Next
-				</a>
+				<a href={ templ.SafeURL(data.searchURL(data.Page + 1)) }>Next</a>
 			}
 		</div>
 	}

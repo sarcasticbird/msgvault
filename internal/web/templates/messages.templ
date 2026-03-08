@@ -132,7 +132,7 @@ func (d MessagesData) browseBackURL() string {
 
 templ Messages(data MessagesData) {
 	@Layout("Messages", "messages") {
-		<nav style="margin-bottom: 12px; font-size: 13px; color: var(--fg-muted);">
+		<nav class="breadcrumb">
 			<a href={ templ.SafeURL(data.browseBackURL()) }>Browse</a>
 			<span> / </span>
 			<strong style="color: var(--fg);">{ data.filterSummary() }</strong>
@@ -143,7 +143,7 @@ templ Messages(data MessagesData) {
 				<p>No messages match the current filters.</p>
 			</div>
 		} else {
-			<div style="margin-bottom: 8px; font-size: 12px; color: var(--fg-muted);">
+			<div class="result-count">
 				Showing { formatCount(int64(len(data.Messages))) } messages
 				if data.Page > 1 {
 					(page { fmt.Sprintf("%d", data.Page) })
@@ -179,33 +179,7 @@ templ MessageTable(data MessagesData) {
 		</thead>
 		<tbody>
 			for _, msg := range data.Messages {
-				<tr>
-					<td style="white-space: nowrap; font-size: 12px; color: var(--fg-muted);">
-						{ formatMessageDate(msg.SentAt) }
-					</td>
-					<td style="max-width: 200px;">
-						if msg.FromName != "" {
-							{ msg.FromName }
-						} else {
-							{ msg.FromEmail }
-						}
-					</td>
-					<td style="max-width: 400px;">
-						<a href={ templ.SafeURL(fmt.Sprintf("/messages/%d", msg.ID)) }>
-							if msg.Subject != "" {
-								{ msg.Subject }
-							} else {
-								<em>(no subject)</em>
-							}
-						</a>
-						if msg.HasAttachments {
-							<span title={ fmt.Sprintf("%d attachment(s)", msg.AttachmentCount) } style="margin-left: 4px; font-size: 11px; color: var(--fg-muted);">
-								{ fmt.Sprintf("[%d]", msg.AttachmentCount) }
-							</span>
-						}
-					</td>
-					<td class="num">{ formatBytes(msg.SizeEstimate) }</td>
-				</tr>
+				@messageRow(msg)
 			}
 		</tbody>
 	</table>
@@ -213,26 +187,67 @@ templ MessageTable(data MessagesData) {
 
 templ pagination(data MessagesData) {
 	if data.Page > 1 || data.HasMore {
-		<div style="margin-top: 12px; display: flex; justify-content: center; gap: 4px; align-items: center; font-size: 13px;">
+		<div class="pagination">
 			if data.Page > 1 {
-				<a
-					href={ templ.SafeURL(data.pageURL(data.Page - 1)) }
-					style="padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-				>
-					Prev
-				</a>
+				<a href={ templ.SafeURL(data.pageURL(data.Page - 1)) }>Prev</a>
 			}
-			<span style="padding: 4px 8px; color: var(--fg-muted);">
+			<span class="page-info">
 				Page { fmt.Sprintf("%d", data.Page) }
 			</span>
 			if data.HasMore {
-				<a
-					href={ templ.SafeURL(data.pageURL(data.Page + 1)) }
-					style="padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-				>
-					Next
-				</a>
+				<a href={ templ.SafeURL(data.pageURL(data.Page + 1)) }>Next</a>
 			}
 		</div>
 	}
+}
+
+// messageListTable renders a simple (non-sortable) message table.
+// Shared between search results and other simple message lists.
+templ messageListTable(messages []query.MessageSummary) {
+	<table class="data-table">
+		<thead>
+			<tr>
+				<th>Date</th>
+				<th>From</th>
+				<th>Subject</th>
+				<th class="num">Size</th>
+			</tr>
+		</thead>
+		<tbody>
+			for _, msg := range messages {
+				@messageRow(msg)
+			}
+		</tbody>
+	</table>
+}
+
+// messageRow renders a single message row, shared across all message tables.
+templ messageRow(msg query.MessageSummary) {
+	<tr>
+		<td class="date-cell">
+			{ formatMessageDate(msg.SentAt) }
+		</td>
+		<td style="max-width: 200px;">
+			if msg.FromName != "" {
+				{ msg.FromName }
+			} else {
+				{ msg.FromEmail }
+			}
+		</td>
+		<td>
+			<a href={ templ.SafeURL(fmt.Sprintf("/messages/%d", msg.ID)) }>
+				if msg.Subject != "" {
+					{ msg.Subject }
+				} else {
+					<em>(no subject)</em>
+				}
+			</a>
+			if msg.HasAttachments {
+				<span title={ fmt.Sprintf("%d attachment(s)", msg.AttachmentCount) } class="attachment-badge">
+					{ fmt.Sprintf("[%d]", msg.AttachmentCount) }
+				</span>
+			}
+		</td>
+		<td class="num">{ formatBytes(msg.SizeEstimate) }</td>
+	</tr>
 }

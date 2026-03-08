@@ -123,10 +123,11 @@ func (d BrowseData) drillURL(key string) string {
 	q.Set("view", d.ViewType)
 	if key == "" {
 		q.Set(filterKey, "")
-		q.Set("empty_"+filterKey, "1")
 	} else {
 		q.Set(filterKey, key)
 	}
+	q.Set("sort", d.SortField)
+	q.Set("dir", d.SortDir)
 	d.addDrillParams(q)
 	if d.Granularity != "" {
 		q.Set("granularity", d.Granularity)
@@ -141,7 +142,6 @@ func (d BrowseData) messagesURL(key string) string {
 	q := url.Values{}
 	if key == "" {
 		q.Set(filterKey, "")
-		q.Set("empty_"+filterKey, "1")
 	} else {
 		q.Set(filterKey, key)
 	}
@@ -216,8 +216,8 @@ templ Aggregates(data BrowseData) {
 		if data.Stats != nil {
 			@StatsBar(data.Stats)
 		}
-		<div style="margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
-			<div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+		<div class="toolbar">
+			<div class="toolbar-left">
 				@viewSelector(data)
 				if data.ViewType == "time" {
 					@granularitySelector(data)
@@ -226,7 +226,7 @@ templ Aggregates(data BrowseData) {
 			@filterControls(data)
 		</div>
 		if len(data.Breadcrumbs) > 0 {
-			<nav style="margin-bottom: 12px; font-size: 13px; color: var(--fg-muted);">
+			<nav class="breadcrumb">
 				for i, bc := range data.Breadcrumbs {
 					if i > 0 {
 						<span> / </span>
@@ -306,17 +306,18 @@ templ AggregateTable(data BrowseData) {
 		</tbody>
 	</table>
 	if len(data.Rows) > 0 {
-		<div style="margin-top: 8px; font-size: 12px; color: var(--fg-muted);">
+		<div class="result-count" style="margin-top: 8px;">
 			Showing { formatCount(int64(len(data.Rows))) } of { formatCount(data.Rows[0].TotalUnique) } unique entries
 		</div>
 	}
 }
 
 templ viewSelector(data BrowseData) {
-	<div style="display: flex; gap: 4px;">
+	<div class="pill-group">
 		@viewTab("Senders", "senders", data)
 		@viewTab("Names", "sender_names", data)
 		@viewTab("Recipients", "recipients", data)
+		@viewTab("Rcpt Names", "recipient_names", data)
 		@viewTab("Domains", "domains", data)
 		@viewTab("Labels", "labels", data)
 		@viewTab("Time", "time", data)
@@ -325,24 +326,14 @@ templ viewSelector(data BrowseData) {
 
 templ viewTab(label string, viewType string, data BrowseData) {
 	if data.ViewType == viewType {
-		<a
-			href={ templ.SafeURL(data.ViewTabURL(viewType)) }
-			style="padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; background: var(--accent); color: #fff; text-decoration: none;"
-		>
-			{ label }
-		</a>
+		<a href={ templ.SafeURL(data.ViewTabURL(viewType)) } class="pill active">{ label }</a>
 	} else {
-		<a
-			href={ templ.SafeURL(data.ViewTabURL(viewType)) }
-			style="padding: 4px 10px; border-radius: 4px; font-size: 12px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-		>
-			{ label }
-		</a>
+		<a href={ templ.SafeURL(data.ViewTabURL(viewType)) } class="pill">{ label }</a>
 	}
 }
 
 templ granularitySelector(data BrowseData) {
-	<div style="display: flex; gap: 4px; margin-left: 8px;">
+	<div class="pill-group" style="margin-left: 8px;">
 		@granularityTab("Year", "year", data)
 		@granularityTab("Month", "month", data)
 		@granularityTab("Day", "day", data)
@@ -351,53 +342,23 @@ templ granularitySelector(data BrowseData) {
 
 templ granularityTab(label string, granularity string, data BrowseData) {
 	if data.Granularity == granularity {
-		<a
-			href={ templ.SafeURL(data.granularityTabURL(granularity)) }
-			style="padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; background: var(--fg-muted); color: var(--bg); text-decoration: none;"
-		>
-			{ label }
-		</a>
+		<a href={ templ.SafeURL(data.granularityTabURL(granularity)) } class="pill-sm active-muted">{ label }</a>
 	} else {
-		<a
-			href={ templ.SafeURL(data.granularityTabURL(granularity)) }
-			style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-		>
-			{ label }
-		</a>
+		<a href={ templ.SafeURL(data.granularityTabURL(granularity)) } class="pill-sm">{ label }</a>
 	}
 }
 
 templ filterControls(data BrowseData) {
-	<div style="display: flex; gap: 8px; align-items: center; font-size: 12px;">
+	<div class="toolbar-right">
 		if data.Attachments {
-			<a
-				href={ templ.SafeURL(data.filterToggleURL("attachments", true)) }
-				style="padding: 2px 8px; border-radius: 3px; font-size: 11px; background: var(--accent); color: #fff; text-decoration: none;"
-			>
-				Attachments Only
-			</a>
+			<a href={ templ.SafeURL(data.filterToggleURL("attachments", true)) } class="pill-sm active">Attachments Only</a>
 		} else {
-			<a
-				href={ templ.SafeURL(data.filterToggleURL("attachments", false)) }
-				style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-			>
-				Attachments Only
-			</a>
+			<a href={ templ.SafeURL(data.filterToggleURL("attachments", false)) } class="pill-sm">Attachments Only</a>
 		}
 		if data.HideDeleted {
-			<a
-				href={ templ.SafeURL(data.filterToggleURL("hide_deleted", true)) }
-				style="padding: 2px 8px; border-radius: 3px; font-size: 11px; background: var(--accent); color: #fff; text-decoration: none;"
-			>
-				Hide Deleted
-			</a>
+			<a href={ templ.SafeURL(data.filterToggleURL("hide_deleted", true)) } class="pill-sm active">Hide Deleted</a>
 		} else {
-			<a
-				href={ templ.SafeURL(data.filterToggleURL("hide_deleted", false)) }
-				style="padding: 2px 8px; border-radius: 3px; font-size: 11px; border: 1px solid var(--border); color: var(--fg-muted); text-decoration: none;"
-			>
-				Hide Deleted
-			</a>
+			<a href={ templ.SafeURL(data.filterToggleURL("hide_deleted", false)) } class="pill-sm">Hide Deleted</a>
 		}
 	</div>
 }

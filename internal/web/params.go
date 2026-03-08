@@ -173,6 +173,8 @@ func messageSortFieldToString(f query.MessageSortField) string {
 	}
 }
 
+const defaultPageSize = 100
+
 func parsePage(r *http.Request) int {
 	s := r.URL.Query().Get("page")
 	if s == "" {
@@ -233,8 +235,8 @@ func parseMessageFilter(r *http.Request) query.MessageFilter {
 
 	page := parsePage(r)
 	f.Pagination = query.Pagination{
-		Limit:  100,
-		Offset: (page - 1) * 100,
+		Limit:  defaultPageSize,
+		Offset: (page - 1) * defaultPageSize,
 	}
 
 	return f

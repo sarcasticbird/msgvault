@@ -84,12 +84,23 @@ func formatMessageDate(t time.Time) string {
 	return t.Format("Jan 02, 2006")
 }
 
-// htmlTagRe matches HTML tags for stripping.
-var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+// Regexes for HTML-to-text conversion.
+var (
+	// styleRe and scriptRe strip <style>...</style> and <script>...</script> blocks
+	// (including their content) before tag stripping to avoid rendering CSS/JS as text.
+	// Go's regexp (RE2) doesn't support backreferences, so we use separate patterns.
+	styleRe  = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
+	scriptRe = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+	// htmlTagRe matches HTML tags for stripping.
+	htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+)
 
-// htmlToPlainText strips all HTML tags and returns plain text.
+// htmlToPlainText strips style/script blocks and all HTML tags, returning plain text.
 // Used to extract readable content from HTML email bodies.
 func htmlToPlainText(s string) string {
-	text := htmlTagRe.ReplaceAllString(s, "")
+	// Remove style/script blocks first (their content is not displayable text)
+	text := styleRe.ReplaceAllString(s, "")
+	text = scriptRe.ReplaceAllString(text, "")
+	text = htmlTagRe.ReplaceAllString(text, "")
 	return html.UnescapeString(text)
 }
