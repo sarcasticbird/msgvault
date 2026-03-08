@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/wesm/msgvault/internal/config"
+	"github.com/wesm/msgvault/internal/deletion"
 	"github.com/wesm/msgvault/internal/query"
 	"github.com/wesm/msgvault/internal/scheduler"
 	"github.com/wesm/msgvault/internal/store"
@@ -141,7 +143,15 @@ func (s *Server) setupRouter() chi.Router {
 
 	// Web UI (enabled when query engine is provided)
 	if s.engine != nil {
-		webHandler := web.NewHandler(s.engine)
+		var delMgr *deletion.Manager
+		deletionsDir := filepath.Join(s.cfg.Data.DataDir, "deletions")
+		mgr, err := deletion.NewManager(deletionsDir)
+		if err != nil {
+			s.logger.Error("failed to create deletion manager", "error", err)
+		} else {
+			delMgr = mgr
+		}
+		webHandler := web.NewHandler(s.engine, delMgr)
 		r.Group(func(r chi.Router) {
 			r.Use(s.authMiddleware)
 			r.Mount("/", webHandler.Routes())

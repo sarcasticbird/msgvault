@@ -115,6 +115,13 @@ templ messageHeader(msg *query.MessageDetail) {
 				</a>
 			</div>
 		}
+		<div class="msg-section" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+			<form method="POST" action={ templ.SafeURL(fmt.Sprintf("/deletions/stage/%d", msg.ID)) } style="display: inline;">
+				<button type="submit" class="btn-danger-sm" onclick="return confirm('Stage this message for deletion?')">
+					Stage for Deletion
+				</button>
+			</form>
+		</div>
 	</div>
 }
 
