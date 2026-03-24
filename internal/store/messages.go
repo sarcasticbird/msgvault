@@ -678,6 +678,48 @@ func (s *Store) MarkMessagesDeletedByGmailIDBatch(gmailIDs []string) error {
 	return firstErr
 }
 
+// PurgeTrashMessages hard-deletes all messages that carry the TRASH label
+// from the local database. Related rows (message_bodies, message_raw,
+// message_labels, message_recipients, attachments) are removed via CASCADE.
+// Returns the number of messages deleted.
+func (s *Store) PurgeTrashMessages() (int64, error) {
+	result, err := s.db.Exec(`
+		DELETE FROM messages
+		WHERE id IN (
+			SELECT ml.message_id
+			FROM message_labels ml
+			JOIN labels l ON l.id = ml.label_id
+			WHERE l.source_label_id = 'TRASH'
+			   OR l.name = 'Trash'
+			   OR l.name LIKE '%/Trash'
+		)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// PurgeTrashMessagesForSource hard-deletes messages with TRASH label for a
+// specific source. Returns the number of messages deleted.
+func (s *Store) PurgeTrashMessagesForSource(sourceID int64) (int64, error) {
+	result, err := s.db.Exec(`
+		DELETE FROM messages
+		WHERE source_id = ? AND id IN (
+			SELECT ml.message_id
+			FROM message_labels ml
+			JOIN labels l ON l.id = ml.label_id
+			WHERE l.source_label_id = 'TRASH'
+			   OR l.name = 'Trash'
+			   OR l.name LIKE '%/Trash'
+		)
+	`, sourceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 // CountMessagesForSource returns the count of messages for a specific source (account).
 func (s *Store) CountMessagesForSource(sourceID int64) (int64, error) {
 	var count int64

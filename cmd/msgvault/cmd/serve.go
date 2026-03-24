@@ -325,10 +325,24 @@ func runScheduledImport(ctx context.Context, s *store.Store, mailDir, identifier
 		"duration", time.Since(startTime),
 	)
 
-	// Build cache after import if there were new messages
-	if summary.MessagesAdded > 0 {
-		logger.Info("building cache after import", "identifier", identifier)
-		result, err := buildCache(cfg.DatabaseDSN(), cfg.AnalyticsDir(), false)
+	// Purge trashed messages after import to keep archive clean
+	var purged int64
+	source, err := s.GetSourceByIdentifier(identifier)
+	if err == nil && source != nil {
+		purged, err = s.PurgeTrashMessagesForSource(source.ID)
+		if err != nil {
+			logger.Error("trash purge failed", "error", err)
+		} else if purged > 0 {
+			logger.Info("purged trashed messages", "identifier", identifier, "count", purged)
+		}
+	}
+
+	// Rebuild cache after import if data changed.
+	// Full rebuild when trash was purged (deleted rows need re-export).
+	if summary.MessagesAdded > 0 || purged > 0 {
+		fullRebuild := purged > 0
+		logger.Info("building cache after import", "identifier", identifier, "full_rebuild", fullRebuild)
+		result, err := buildCache(cfg.DatabaseDSN(), cfg.AnalyticsDir(), fullRebuild)
 		if err != nil {
 			logger.Error("cache build failed", "error", err)
 		} else if !result.Skipped {
