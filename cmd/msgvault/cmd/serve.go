@@ -19,6 +19,7 @@ import (
 	"github.com/wesm/msgvault/internal/oauth"
 	"github.com/wesm/msgvault/internal/query"
 	"github.com/wesm/msgvault/internal/scheduler"
+	"github.com/wesm/msgvault/internal/search"
 	"github.com/wesm/msgvault/internal/store"
 	"github.com/wesm/msgvault/internal/sync"
 )
@@ -59,13 +60,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := cfg.Server.ValidateSecure(); err != nil {
 		return err
 	}
+	if cfg.Server.APIKey != "" && len(cfg.Server.APIKey) < 16 {
+		logger.Warn("api_key is very short — use a randomly generated key of at least 32 characters")
+	}
 
 	// Check for scheduled Gmail accounts and imports
 	hasGmailAccounts := len(cfg.ScheduledAccounts()) > 0
 	hasImports := len(cfg.ScheduledImports()) > 0
 
 	// OAuth is required only when Gmail sync accounts are configured
-	if hasGmailAccounts && cfg.OAuth.ClientSecrets == "" {
+	if hasGmailAccounts && !cfg.OAuth.HasAnyConfig() {
 		return errOAuthNotConfigured()
 	}
 
@@ -80,20 +84,41 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	if err := s.InitSchema(); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
 
-	// Create OAuth manager (nil if no Gmail accounts configured)
-	var oauthMgr *oauth.Manager
-	if cfg.OAuth.ClientSecrets != "" {
-		oauthMgr, err = oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
-		if err != nil {
-			return wrapOAuthError(fmt.Errorf("create oauth manager: %w", err))
+	// Create query engine for TUI aggregate support.
+	// Prefer DuckDB over Parquet when the cache is complete and fresh;
+	// otherwise fall back to SQLite so remote endpoints still work.
+	analyticsDir := cfg.AnalyticsDir()
+	var engine query.Engine
+	staleness := cacheNeedsBuild(dbPath, analyticsDir)
+	if !staleness.NeedsBuild && query.HasCompleteParquetData(analyticsDir) {
+		duckEngine, engineErr := query.NewDuckDBEngine(
+			analyticsDir, dbPath, s.DB(),
+		)
+		if engineErr != nil {
+			logger.Warn("DuckDB engine failed, falling back to SQLite",
+				"error", engineErr)
+			engine = query.NewSQLiteEngine(s.DB())
+		} else {
+			engine = duckEngine
 		}
+	} else {
+		if staleness.Reason != "" {
+			logger.Info("parquet cache not usable, using SQLite engine",
+				"reason", staleness.Reason)
+		} else {
+			logger.Info("parquet cache not built - using SQLite engine (run 'msgvault build-cache' for faster aggregates)")
+		}
+		engine = query.NewSQLiteEngine(s.DB())
 	}
+	defer func() { _ = engine.Close() }()
+
+	getOAuthMgr := oauthManagerCache()
 
 	// Build import lookup table for dispatch
 	importConfigs := make(map[string]struct{ path, identifier, attachmentsDir string })
@@ -109,7 +134,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if ic, ok := importConfigs[key]; ok {
 			return runScheduledImport(ctx, s, ic.path, ic.identifier, ic.attachmentsDir)
 		}
-		return runScheduledSync(ctx, key, s, oauthMgr)
+		return runScheduledSync(ctx, key, s, getOAuthMgr)
 	}
 
 	// Create and configure scheduler
@@ -153,41 +178,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	storeAdapter := &storeAPIAdapter{store: s}
 	schedAdapter := &schedulerAdapter{scheduler: sched}
 
-	// Initialize query engine for web UI
-	var serverOpts []api.ServerOption
-	analyticsDir := cfg.AnalyticsDir()
-
-	// Build cache if needed (same logic as TUI)
-	needsBuild, reason := cacheNeedsBuild(dbPath, analyticsDir)
-	if needsBuild {
-		fmt.Printf("Building analytics cache (%s)...\n", reason)
-		result, err := buildCache(dbPath, analyticsDir, true)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Failed to build cache: %v\n", err)
-		} else if !result.Skipped {
-			fmt.Printf("Cached %d messages for fast queries.\n", result.ExportedCount)
-		}
-	}
-
-	if query.HasCompleteParquetData(analyticsDir) {
-		duckEngine, err := query.NewDuckDBEngine(analyticsDir, dbPath, s.DB(), query.DuckDBOptions{})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Failed to open query engine for web UI: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Web UI will be disabled. JSON API still available.\n")
-		} else {
-			defer duckEngine.Close()
-			serverOpts = append(serverOpts, api.WithQueryEngine(duckEngine))
-			logger.Info("web UI enabled", "analytics_dir", analyticsDir)
-		}
-	} else {
-		// Fall back to SQLite engine
-		sqlEngine := query.NewSQLiteEngine(s.DB())
-		serverOpts = append(serverOpts, api.WithQueryEngine(sqlEngine))
-		logger.Info("web UI enabled (SQLite fallback - may be slow for large archives)")
-	}
-
 	// Create and start API server
-	apiServer := api.NewServer(cfg, storeAdapter, schedAdapter, logger, serverOpts...)
+	apiServer := api.NewServerWithOptions(api.ServerOptions{
+		Config:    cfg,
+		Store:     storeAdapter,
+		Engine:    engine,
+		Scheduler: schedAdapter,
+		Logger:    logger,
+	})
 
 	// Start API server in goroutine
 	serverErr := make(chan error, 1)
@@ -275,6 +273,10 @@ func (a *storeAPIAdapter) SearchMessages(query string, offset, limit int) ([]api
 	return a.store.SearchMessages(query, offset, limit)
 }
 
+func (a *storeAPIAdapter) SearchMessagesQuery(q *search.Query, offset, limit int) ([]api.APIMessage, int64, error) {
+	return a.store.SearchMessagesQuery(q, offset, limit)
+}
+
 // schedulerAdapter adapts scheduler.Scheduler to api.SyncScheduler.
 // Since api.AccountStatus is a type alias for scheduler.AccountStatus,
 // the adapter methods are simple pass-throughs.
@@ -358,9 +360,25 @@ func runScheduledImport(ctx context.Context, s *store.Store, mailDir, identifier
 }
 
 // runScheduledSync performs an incremental sync for a scheduled account.
-func runScheduledSync(ctx context.Context, email string, s *store.Store, oauthMgr *oauth.Manager) error {
+func runScheduledSync(ctx context.Context, email string, s *store.Store, getOAuthMgr func(string) (*oauth.Manager, error)) error {
 	logger.Info("starting scheduled sync", "email", email)
 	startTime := time.Now()
+
+	// Look up source to get OAuth app binding. Fall back to default
+	// if no source row exists (token-first workflow).
+	appName := ""
+	src, srcErr := findGmailSource(s, email)
+	if srcErr != nil {
+		return fmt.Errorf("look up source for %s: %w", email, srcErr)
+	}
+	if src != nil {
+		appName = sourceOAuthApp(src)
+	}
+
+	oauthMgr, err := getOAuthMgr(appName)
+	if err != nil {
+		return fmt.Errorf("resolve OAuth credentials for %s: %w", email, err)
+	}
 
 	// Get token source — intentionally not using getTokenSourceWithReauth here
 	// because serve runs as a daemon and cannot open a browser for OAuth.
@@ -378,7 +396,7 @@ func runScheduledSync(ctx context.Context, email string, s *store.Store, oauthMg
 		gmail.WithLogger(logger),
 		gmail.WithRateLimiter(rateLimiter),
 	)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Set up sync options
 	opts := sync.DefaultOptions()
@@ -405,10 +423,15 @@ func runScheduledSync(ctx context.Context, email string, s *store.Store, oauthMg
 		"duration", time.Since(startTime),
 	)
 
-	// Build cache after sync if there were new messages
-	if summary.MessagesAdded > 0 {
-		logger.Info("building cache after sync", "email", email)
-		result, err := buildCache(cfg.DatabaseDSN(), cfg.AnalyticsDir(), false)
+	// Rebuild cache if stale (covers new messages and deletions).
+	dbPath := cfg.DatabaseDSN()
+	analyticsDir := cfg.AnalyticsDir()
+	if staleness := cacheNeedsBuild(dbPath, analyticsDir); staleness.NeedsBuild {
+		logger.Info("rebuilding cache after sync",
+			"email", email, "reason", staleness.Reason,
+			"full_rebuild", staleness.FullRebuild)
+		result, err := buildCache(
+			dbPath, analyticsDir, staleness.FullRebuild)
 		if err != nil {
 			logger.Error("cache build failed", "error", err)
 			// Don't fail the sync for cache build errors

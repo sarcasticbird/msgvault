@@ -4,7 +4,9 @@
 
 When a task involves multiple steps (e.g., implement + commit + PR), complete ALL steps in sequence without stopping. If creating a branch, committing, and opening a PR, finish the entire chain.
 
-Always commit after every turn. Don't wait for the user to ask — if you made changes, commit them before responding.
+Always commit after every turn. Don't wait for the user to ask — if you made changes, commit them before responding. Do not ask "shall I commit?" or "want me to commit?" — just commit. Committing is not a destructive or risky action; it is the expected default after every change.
+
+PR descriptions should be concise and changelog-oriented: what changed, why, and how to use it. Do not include test plans, design decisions, or implementation details — those belong in specs and commit messages.
 
 ## Project Overview
 
@@ -46,6 +48,7 @@ make lint                     # Run linter
 ./msgvault init-db                                    # Initialize database
 ./msgvault add-account you@gmail.com                  # Browser OAuth
 ./msgvault add-account you@gmail.com --headless       # Device flow
+./msgvault add-account you@acme.com --oauth-app acme  # Named OAuth app
 ./msgvault sync-full you@gmail.com --limit 100        # Sync with limit
 ./msgvault sync-full you@gmail.com --after 2024-01-01 # Sync date range
 ./msgvault sync-incremental you@gmail.com             # Incremental sync
@@ -53,6 +56,7 @@ make lint                     # Run linter
 # TUI and analytics
 ./msgvault tui                                        # Launch TUI
 ./msgvault tui --account you@gmail.com                # Filter by account
+./msgvault tui --local                                # Force local (override remote config)
 ./msgvault build-cache                                # Build Parquet cache
 ./msgvault build-cache --full-rebuild                 # Full rebuild
 ./msgvault stats                                      # Show archive stats
@@ -62,6 +66,9 @@ make lint                     # Run linter
 ./msgvault import-emlx ~/Library/Mail                 # Explicit mail directory
 ./msgvault import-emlx --account me@gmail.com         # Specific account(s)
 ./msgvault import-emlx /path/to/dir --identifier me@gmail.com  # Manual fallback
+
+# Daemon mode (NAS/server deployment)
+./msgvault serve                                      # Start HTTP API + scheduled syncs
 
 # Maintenance
 ./msgvault repair-encoding                            # Fix UTF-8 encoding issues
@@ -189,13 +196,15 @@ When committing changes, always stage ALL modified files (including formatting, 
 ## Code Style & Linting
 
 All code must pass formatting and linting checks before commit. A pre-commit
-hook is available to enforce this automatically:
+hook is available via [prek](https://prek.j178.dev/) to enforce this
+automatically:
 
 ```bash
-make setup-hooks               # Enable pre-commit hook (fmt + lint)
+make install-hooks             # Install pre-commit hook via prek
 make test                      # Run tests
 make fmt                       # Format code (go fmt)
-make lint                      # Run linter (golangci-lint)
+make lint                      # Run linter (auto-fix)
+make lint-ci                   # Run linter (CI, no auto-fix)
 go vet ./...                   # Check for issues
 ```
 
@@ -251,6 +260,10 @@ Override with `MSGVAULT_HOME` environment variable.
 
 [oauth]
 client_secrets = "/path/to/client_secret.json"
+
+# Named OAuth apps for Google Workspace orgs
+# [oauth.apps.acme]
+# client_secrets = "/path/to/acme_secret.json"
 
 [sync]
 rate_limit_qps = 5

@@ -316,6 +316,92 @@ func TestStore_Label(t *testing.T) {
 	}
 }
 
+func TestStore_EnsureLabel_NameConflict(t *testing.T) {
+	f := storetest.New(t)
+
+	// Create label L1 with name "Work"
+	lid1, err := f.Store.EnsureLabel(f.Source.ID, "L1", "Work", "user")
+	testutil.MustNoErr(t, err, "create L1")
+
+	// Insert a different label L2 with the same name — should upsert,
+	// not crash with UNIQUE constraint violation (#232).
+	lid2, err := f.Store.EnsureLabel(f.Source.ID, "L2", "Work", "user")
+	testutil.MustNoErr(t, err, "create L2 with same name")
+
+	if lid2 != lid1 {
+		t.Errorf("L2 ID = %d, want %d (should reuse existing row)", lid2, lid1)
+	}
+
+	// L1's source_label_id was overwritten — looking up L2 should work
+	lid2Again, err := f.Store.EnsureLabel(f.Source.ID, "L2", "Work", "user")
+	testutil.MustNoErr(t, err, "re-lookup L2")
+	if lid2Again != lid1 {
+		t.Errorf("re-lookup L2 ID = %d, want %d", lid2Again, lid1)
+	}
+}
+
+func TestStore_EnsureLabel_Rename(t *testing.T) {
+	f := storetest.New(t)
+
+	// Create label L1 with name "OldName"
+	lid, err := f.Store.EnsureLabel(f.Source.ID, "L1", "OldName", "user")
+	testutil.MustNoErr(t, err, "create L1")
+
+	// Same source_label_id, different name (label was renamed in Gmail)
+	lid2, err := f.Store.EnsureLabel(f.Source.ID, "L1", "NewName", "user")
+	testutil.MustNoErr(t, err, "rename L1")
+
+	if lid2 != lid {
+		t.Errorf("renamed label ID = %d, want %d", lid2, lid)
+	}
+}
+
+func TestStore_EnsureLabel_RenameAndReuse(t *testing.T) {
+	f := storetest.New(t)
+
+	// Scenario: L1 named "Foo" is renamed to "Bar", then L2 takes "Foo".
+	_, err := f.Store.EnsureLabel(f.Source.ID, "L1", "Foo", "user")
+	testutil.MustNoErr(t, err, "create L1=Foo")
+
+	// L1 renamed to "Bar" — should update name in place
+	_, err = f.Store.EnsureLabel(f.Source.ID, "L1", "Bar", "user")
+	testutil.MustNoErr(t, err, "rename L1=Bar")
+
+	// New label L2 takes the old name "Foo" — should succeed
+	_, err = f.Store.EnsureLabel(f.Source.ID, "L2", "Foo", "user")
+	testutil.MustNoErr(t, err, "create L2=Foo")
+}
+
+func TestStore_EnsureLabel_RenameSwap(t *testing.T) {
+	f := storetest.New(t)
+
+	// L1="Foo" exists, and L1 is renamed to the name of an existing
+	// label "Bar" (which has source_label_id "L2"). The rename merges
+	// L2 into L1 so L1 can take the name.
+	lid1, err := f.Store.EnsureLabel(f.Source.ID, "L1", "Foo", "user")
+	testutil.MustNoErr(t, err, "create L1=Foo")
+
+	lid2, err := f.Store.EnsureLabel(f.Source.ID, "L2", "Bar", "user")
+	testutil.MustNoErr(t, err, "create L2=Bar")
+
+	// Tag a message with L2 so we can verify associations survive merge
+	msgID := f.CreateMessage("swap-msg")
+	err = f.Store.ReplaceMessageLabels(msgID, []int64{lid2})
+	testutil.MustNoErr(t, err, "tag message with L2")
+
+	// L1 renamed to "Bar" — merges L2 into L1
+	lid1After, err := f.Store.EnsureLabel(f.Source.ID, "L1", "Bar", "user")
+	testutil.MustNoErr(t, err, "rename L1=Bar (was L2's name)")
+
+	if lid1After != lid1 {
+		t.Errorf("L1 ID changed: got %d, want %d", lid1After, lid1)
+	}
+
+	// Message should now be associated with L1 (not the deleted L2)
+	f.AssertLabelCount(msgID, 1)
+	f.AssertMessageHasLabel(msgID, lid1)
+}
+
 func TestStore_EnsureLabelsBatch(t *testing.T) {
 	f := storetest.New(t)
 
@@ -336,6 +422,50 @@ func TestStore_EnsureLabelsBatch(t *testing.T) {
 			t.Errorf("%s should be in result", sourceLabelID)
 		}
 	}
+}
+
+func TestStore_EnsureLabelsBatch_CrossRename(t *testing.T) {
+	f := storetest.New(t)
+
+	// Initial state: L1="Foo", L2="Bar"
+	initial := map[string]store.LabelInfo{
+		"L1": {Name: "Foo", Type: "user"},
+		"L2": {Name: "Bar", Type: "user"},
+	}
+	ids, err := f.Store.EnsureLabelsBatch(f.Source.ID, initial)
+	testutil.MustNoErr(t, err, "initial batch")
+
+	l1ID, l2ID := ids["L1"], ids["L2"]
+
+	// Tag messages with each label
+	msg1 := f.CreateMessage("cross-1")
+	msg2 := f.CreateMessage("cross-2")
+	err = f.Store.ReplaceMessageLabels(msg1, []int64{l1ID})
+	testutil.MustNoErr(t, err, "tag msg1 with L1")
+	err = f.Store.ReplaceMessageLabels(msg2, []int64{l2ID})
+	testutil.MustNoErr(t, err, "tag msg2 with L2")
+
+	// Cross-rename: L1→"Bar", L2→"Foo"
+	swapped := map[string]store.LabelInfo{
+		"L1": {Name: "Bar", Type: "user"},
+		"L2": {Name: "Foo", Type: "user"},
+	}
+	ids2, err := f.Store.EnsureLabelsBatch(f.Source.ID, swapped)
+	testutil.MustNoErr(t, err, "cross-rename batch")
+
+	// IDs should be preserved
+	if ids2["L1"] != l1ID {
+		t.Errorf("L1 id changed: got %d, want %d", ids2["L1"], l1ID)
+	}
+	if ids2["L2"] != l2ID {
+		t.Errorf("L2 id changed: got %d, want %d", ids2["L2"], l2ID)
+	}
+
+	// Each message should still be linked to its original label ID
+	f.AssertLabelCount(msg1, 1)
+	f.AssertMessageHasLabel(msg1, l1ID)
+	f.AssertLabelCount(msg2, 1)
+	f.AssertMessageHasLabel(msg2, l2ID)
 }
 
 func TestStore_MessageLabels(t *testing.T) {
@@ -500,6 +630,24 @@ func TestStore_SyncFail(t *testing.T) {
 	}
 	if errorMsg != "network error" {
 		t.Errorf("error_message = %q, want %q", errorMsg, "network error")
+	}
+}
+
+func TestStore_GetMessage_DeletedMessageVisibleByID(t *testing.T) {
+	f := storetest.New(t)
+
+	msgID := f.CreateMessage("deleted-msg-1")
+	_, err := f.Store.DB().Exec(
+		f.Store.Rebind("UPDATE messages SET deleted_from_source_at = ? WHERE id = ?"),
+		time.Date(2026, 3, 18, 14, 30, 0, 0, time.UTC),
+		msgID,
+	)
+	testutil.MustNoErr(t, err, "mark deleted")
+
+	msg, err := f.Store.GetMessage(msgID)
+	testutil.MustNoErr(t, err, "GetMessage()")
+	if msg == nil {
+		t.Fatal("GetMessage() = nil, want deleted message")
 	}
 }
 
@@ -1336,6 +1484,59 @@ func TestStore_PersistMessage_Atomicity(t *testing.T) {
 	testutil.MustNoErr(t, err, "MessageExistsBatch")
 	if len(existing) != 0 {
 		t.Errorf("message should not exist after failed PersistMessage, found %d", len(existing))
+	}
+}
+
+func TestStore_OAuthAppColumn(t *testing.T) {
+	f := storetest.New(t)
+
+	// Default source should have null oauth_app
+	if f.Source.OAuthApp.Valid {
+		t.Errorf("new source OAuthApp should be null, got %q", f.Source.OAuthApp.String)
+	}
+
+	// Update oauth_app
+	err := f.Store.UpdateSourceOAuthApp(f.Source.ID, sql.NullString{String: "acme", Valid: true})
+	testutil.MustNoErr(t, err, "UpdateSourceOAuthApp")
+
+	// Read it back via ListSources
+	sources, err := f.Store.ListSources("")
+	testutil.MustNoErr(t, err, "ListSources")
+
+	found := false
+	for _, src := range sources {
+		if src.ID == f.Source.ID {
+			found = true
+			if !src.OAuthApp.Valid || src.OAuthApp.String != "acme" {
+				t.Errorf("OAuthApp = %v, want {acme, true}", src.OAuthApp)
+			}
+		}
+	}
+	if !found {
+		t.Error("source not found in ListSources")
+	}
+}
+
+func TestStore_OAuthAppColumn_NullRoundTrip(t *testing.T) {
+	f := storetest.New(t)
+
+	// Set to acme
+	err := f.Store.UpdateSourceOAuthApp(f.Source.ID, sql.NullString{String: "acme", Valid: true})
+	testutil.MustNoErr(t, err, "UpdateSourceOAuthApp(acme)")
+
+	// Set back to null
+	err = f.Store.UpdateSourceOAuthApp(f.Source.ID, sql.NullString{})
+	testutil.MustNoErr(t, err, "UpdateSourceOAuthApp(null)")
+
+	// Verify via GetSourcesByIdentifier
+	sources, err := f.Store.GetSourcesByIdentifier(f.Source.Identifier)
+	testutil.MustNoErr(t, err, "GetSourcesByIdentifier")
+
+	if len(sources) == 0 {
+		t.Fatal("no sources found")
+	}
+	if sources[0].OAuthApp.Valid {
+		t.Errorf("OAuthApp should be null after clearing, got %q", sources[0].OAuthApp.String)
 	}
 }
 

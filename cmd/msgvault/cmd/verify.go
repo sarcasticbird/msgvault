@@ -16,7 +16,10 @@ import (
 	"github.com/wesm/msgvault/internal/store"
 )
 
-var verifySampleSize int
+var (
+	verifySampleSize  int
+	verifySkipDBCheck bool
+)
 
 var verifyCmd = &cobra.Command{
 	Use:   "verify <email>",
@@ -25,21 +28,18 @@ var verifyCmd = &cobra.Command{
 and sampling messages to ensure raw MIME data is intact.
 
 This command:
-1. Compares local message count with Gmail's reported total
-2. Checks how many messages have raw MIME data stored
-3. Samples random messages and verifies their MIME can be decompressed
+1. Runs SQLite integrity checks on the database (unless --skip-db-check)
+2. Compares local message count with Gmail's reported total
+3. Checks how many messages have raw MIME data stored
+4. Samples random messages and verifies their MIME can be decompressed
 
 Examples:
   msgvault verify you@gmail.com
-  msgvault verify you@gmail.com --sample 200`,
+  msgvault verify you@gmail.com --sample 200
+  msgvault verify you@gmail.com --skip-db-check`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		email := args[0]
-
-		// Validate config
-		if cfg.OAuth.ClientSecrets == "" {
-			return errOAuthNotConfigured()
-		}
 
 		// Open database
 		dbPath := cfg.DatabaseDSN()
@@ -47,10 +47,37 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
-		defer s.Close()
+		defer func() { _ = s.Close() }()
+
+		if err := s.InitSchema(); err != nil {
+			return fmt.Errorf("init schema: %w", err)
+		}
+
+		// Look up source to get OAuth app binding
+		appName := ""
+		src, srcErr := findGmailSource(s, email)
+		if srcErr != nil {
+			return fmt.Errorf("look up source for %s: %w", email, srcErr)
+		}
+		if src != nil {
+			appName = sourceOAuthApp(src)
+		}
+
+		// Resolve OAuth credentials
+		clientSecretsPath, err := cfg.OAuth.ClientSecretsFor(appName)
+		if err != nil {
+			if !cfg.OAuth.HasAnyConfig() {
+				return errOAuthNotConfigured()
+			}
+			return err
+		}
+
+		if err := s.InitSchema(); err != nil {
+			return fmt.Errorf("init schema: %w", err)
+		}
 
 		// Create OAuth manager and get token source
-		oauthMgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
+		oauthMgr, err := oauth.NewManager(clientSecretsPath, cfg.TokensDir(), logger)
 		if err != nil {
 			return wrapOAuthError(fmt.Errorf("create oauth manager: %w", err))
 		}
@@ -77,7 +104,36 @@ Examples:
 
 		// Create Gmail client (no rate limiter needed for single call)
 		client := gmail.NewClient(tokenSource, gmail.WithLogger(logger))
-		defer client.Close()
+		defer func() { _ = client.Close() }()
+
+		// Run SQLite integrity check first (offline, no Gmail needed)
+		var dbCorrupt bool
+		if !verifySkipDBCheck {
+			fmt.Println("Running database integrity check...")
+			integrityErrors, err := runIntegrityCheck(s)
+			if err != nil {
+				return fmt.Errorf("integrity check failed: %w", err)
+			}
+			if len(integrityErrors) == 0 {
+				fmt.Println("  Database integrity: OK")
+			} else {
+				dbCorrupt = true
+				fmt.Printf("  Database integrity: FAILED (%d errors)\n", len(integrityErrors))
+				for i, ie := range integrityErrors {
+					if i >= 10 {
+						fmt.Printf("  ... and %d more errors\n", len(integrityErrors)-10)
+						break
+					}
+					fmt.Printf("  - %s\n", ie)
+				}
+				fmt.Println()
+				fmt.Println("  The database has corruption. Consider:")
+				fmt.Println("    1. Back up the database file before any repair attempts")
+				fmt.Println("    2. Run: sqlite3 msgvault.db '.recover' | sqlite3 recovered.db")
+				fmt.Println("    3. Or export to SQL and reimport: sqlite3 msgvault.db .dump | sqlite3 new.db")
+			}
+			fmt.Println()
+		}
 
 		// Get Gmail profile
 		profile, err := client.GetProfile(ctx)
@@ -87,14 +143,21 @@ Examples:
 
 		fmt.Printf("Verifying archive for %s...\n\n", profile.EmailAddress)
 
-		// Get source from database
-		source, err := s.GetSourceByIdentifier(profile.EmailAddress)
+		// Look up the Gmail source by the user-supplied identifier,
+		// not the canonical profile address — the source is keyed
+		// under the identifier from add-account. Filter to Gmail
+		// specifically since the same identifier may exist for
+		// other source types (mbox, imap).
+		source, err := findGmailSource(s, email)
 		if err != nil {
 			return fmt.Errorf("get source: %w", err)
 		}
 		if source == nil {
-			fmt.Printf("Account %s not found in database.\n", profile.EmailAddress)
+			fmt.Printf("Gmail account %s not found in database.\n", email)
 			fmt.Println("Run 'sync-full' first to populate the archive.")
+			if dbCorrupt {
+				return fmt.Errorf("database integrity check failed")
+			}
 			return nil
 		}
 
@@ -193,11 +256,38 @@ Examples:
 		fmt.Println()
 		fmt.Println("Verification complete.")
 
+		if dbCorrupt {
+			return fmt.Errorf("database integrity check failed")
+		}
+
 		return nil
 	},
 }
 
+// runIntegrityCheck runs PRAGMA integrity_check on the database and returns
+// any error strings. An empty slice means the database is healthy.
+func runIntegrityCheck(s *store.Store) ([]string, error) {
+	rows, err := s.DB().Query("PRAGMA integrity_check(100)")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var errors []string
+	for rows.Next() {
+		var result string
+		if err := rows.Scan(&result); err != nil {
+			return nil, err
+		}
+		if result != "ok" {
+			errors = append(errors, result)
+		}
+	}
+	return errors, rows.Err()
+}
+
 func init() {
 	verifyCmd.Flags().IntVar(&verifySampleSize, "sample", 100, "Number of messages to sample for MIME verification")
+	verifyCmd.Flags().BoolVar(&verifySkipDBCheck, "skip-db-check", false, "Skip SQLite integrity check")
 	rootCmd.AddCommand(verifyCmd)
 }

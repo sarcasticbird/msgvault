@@ -56,7 +56,7 @@ func showRemoteMessage(idStr string) error {
 	if err != nil {
 		return fmt.Errorf("connect to remote: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	msg, err := s.GetMessage(id)
 	if err != nil {
@@ -80,7 +80,11 @@ func showLocalMessage(cmd *cobra.Command, idStr string) error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
+
+	if err := s.InitSchema(); err != nil {
+		return fmt.Errorf("init schema: %w", err)
+	}
 
 	// Create query engine
 	engine := query.NewSQLiteEngine(s.DB())
@@ -207,22 +211,23 @@ func outputMessageJSON(msg *query.MessageDetail) error {
 	}
 
 	output := map[string]interface{}{
-		"id":                msg.ID,
-		"source_message_id": msg.SourceMessageID,
-		"conversation_id":   msg.ConversationID,
-		"subject":           msg.Subject,
-		"snippet":           msg.Snippet,
-		"sent_at":           msg.SentAt.Format(time.RFC3339),
-		"size_estimate":     msg.SizeEstimate,
-		"has_attachments":   msg.HasAttachments,
-		"from":              fromAddrs,
-		"to":                toAddrs,
-		"cc":                ccAddrs,
-		"bcc":               bccAddrs,
-		"labels":            msg.Labels,
-		"attachments":       attachments,
-		"body_text":         msg.BodyText,
-		"body_html":         msg.BodyHTML,
+		"id":                     msg.ID,
+		"source_message_id":      msg.SourceMessageID,
+		"conversation_id":        msg.ConversationID,
+		"source_conversation_id": msg.SourceConversationID,
+		"subject":                msg.Subject,
+		"snippet":                msg.Snippet,
+		"sent_at":                msg.SentAt.Format(time.RFC3339),
+		"size_estimate":          msg.SizeEstimate,
+		"has_attachments":        msg.HasAttachments,
+		"from":                   fromAddrs,
+		"to":                     toAddrs,
+		"cc":                     ccAddrs,
+		"bcc":                    bccAddrs,
+		"labels":                 msg.Labels,
+		"attachments":            attachments,
+		"body_text":              msg.BodyText,
+		"body_html":              msg.BodyHTML,
 	}
 
 	if msg.ReceivedAt != nil {

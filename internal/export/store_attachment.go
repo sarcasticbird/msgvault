@@ -190,7 +190,7 @@ func validateExistingAttachmentFile(fullPath string, expectedSize int64, expecte
 		}
 		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	st, err := f.Stat()
 	if err != nil {
@@ -206,7 +206,7 @@ func validateExistingAttachmentFile(fullPath string, expectedSize int64, expecte
 	key := fmt.Sprintf("%s\x00%d\x00%s", fullPath, expectedSize, expectedHash)
 	modTime := st.ModTime().UnixNano()
 	if cached, ok := validatedAttachmentFiles.Load(key); ok {
-		if cached.(int64) == modTime {
+		if ts, ok := cached.(int64); ok && ts == modTime {
 			return nil
 		}
 	}

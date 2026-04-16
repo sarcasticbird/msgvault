@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/wesm/msgvault/internal/fileutil"
 	"golang.org/x/oauth2"
@@ -34,11 +36,34 @@ var ScopesDeletion = []string{
 	"https://mail.google.com/",
 }
 
+const defaultProfileURL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+
+// TokenMismatchError is returned when the authorized Google account
+// does not match the expected email. Callers can inspect Expected
+// and Actual to provide context-appropriate remediation.
+type TokenMismatchError struct {
+	Expected string // email the user asked to authorize
+	Actual   string // email returned by the Gmail profile API
+}
+
+func (e *TokenMismatchError) Error() string {
+	return fmt.Sprintf(
+		"token mismatch: expected %s but authorized as %s",
+		e.Expected, e.Actual,
+	)
+}
+
 // Manager handles OAuth2 token acquisition and storage.
 type Manager struct {
-	config    *oauth2.Config
-	tokensDir string
-	logger    *slog.Logger
+	config     *oauth2.Config
+	tokensDir  string
+	logger     *slog.Logger
+	profileURL string // Gmail profile endpoint; overridden in tests
+
+	// browserFlowFn overrides browserFlow in tests to avoid starting
+	// a real HTTP server and browser. When nil, the real browserFlow
+	// is used.
+	browserFlowFn func(ctx context.Context, email string, launchBrowser bool) (*oauth2.Token, error)
 }
 
 // NewManager creates an OAuth manager from client secrets.
@@ -63,7 +88,7 @@ func (m *Manager) TokenSource(ctx context.Context, email string) (oauth2.TokenSo
 		return nil, fmt.Errorf("refresh token: %w", err)
 	}
 
-	if newToken.AccessToken != tf.Token.AccessToken {
+	if newToken.AccessToken != tf.AccessToken {
 		// Preserve the original scopes when saving refreshed token
 		scopes := tf.Scopes
 		if len(scopes) == 0 {
@@ -87,10 +112,15 @@ func (m *Manager) HasToken(email string) bool {
 // Google's device flow does not support Gmail scopes, so users must authorize
 // on a machine with a browser and copy the token file.
 // tokensDir should be the configured tokens directory (e.g., cfg.TokensDir()).
-func PrintHeadlessInstructions(email, tokensDir string) {
+func PrintHeadlessInstructions(email, tokensDir, oauthApp string) {
 	// Use same sanitization as tokenPath for consistency
 	tokenFile := sanitizeEmail(email) + ".json"
 	tokenPath := filepath.Join(tokensDir, tokenFile)
+
+	addCmd := fmt.Sprintf("    msgvault add-account %s", email)
+	if oauthApp != "" {
+		addCmd += fmt.Sprintf(" --oauth-app %s", oauthApp)
+	}
 
 	fmt.Println()
 	fmt.Println("=== Headless Server Setup ===")
@@ -101,7 +131,7 @@ func PrintHeadlessInstructions(email, tokensDir string) {
 	fmt.Println()
 	fmt.Println("Step 1: On a machine with a browser, run:")
 	fmt.Println()
-	fmt.Printf("    msgvault add-account %s\n", email)
+	fmt.Println(addCmd)
 	fmt.Println()
 	fmt.Println("Step 2: Copy the token file to your headless server:")
 	fmt.Println()
@@ -110,7 +140,7 @@ func PrintHeadlessInstructions(email, tokensDir string) {
 	fmt.Println()
 	fmt.Println("Step 3: On the headless server, register the account:")
 	fmt.Println()
-	fmt.Printf("    msgvault add-account %s\n", email)
+	fmt.Println(addCmd)
 	fmt.Println()
 	fmt.Println("The token will be detected and the account registered. No browser needed.")
 	fmt.Println("All msgvault commands (sync, tui, etc.) will work normally.")
@@ -133,9 +163,38 @@ func shellQuote(s string) string {
 }
 
 // Authorize performs the browser OAuth flow for a new account.
+// It opens the default browser and validates that the authorized
+// account matches the expected email.
 func (m *Manager) Authorize(ctx context.Context, email string) error {
-	token, err := m.browserFlow(ctx)
+	return m.authorize(ctx, email, true)
+}
+
+// AuthorizeManual performs the OAuth flow without opening a browser.
+// It prints the authorization URL with clear account context so the
+// user knows exactly which account to authorize. Used during sync
+// re-auth to prevent accidental account mismatch.
+func (m *Manager) AuthorizeManual(ctx context.Context, email string) error {
+	return m.authorize(ctx, email, false)
+}
+
+func (m *Manager) authorize(
+	ctx context.Context, email string, launchBrowser bool,
+) error {
+	flow := m.browserFlow
+	if m.browserFlowFn != nil {
+		flow = m.browserFlowFn
+	}
+	token, err := flow(ctx, email, launchBrowser)
 	if err != nil {
+		return err
+	}
+
+	// Validate the token belongs to the expected account before
+	// persisting it. This prevents token pollution where selecting
+	// the wrong Google account would overwrite a valid token file.
+	// The token is always saved under the original identifier (email)
+	// since that's the key used for all lookups elsewhere in the app.
+	if _, err := m.resolveTokenEmail(ctx, email, token); err != nil {
 		return err
 	}
 
@@ -152,22 +211,32 @@ func (m *Manager) newCallbackHandler(expectedState string, codeChan chan<- strin
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("state") != expectedState {
 			errChan <- fmt.Errorf("state mismatch: possible CSRF attack")
-			fmt.Fprintf(w, "Error: state mismatch")
+			_, _ = fmt.Fprintf(w, "Error: state mismatch")
 			return
 		}
 		code := r.URL.Query().Get("code")
 		if code == "" {
 			errChan <- fmt.Errorf("no code in callback")
-			fmt.Fprintf(w, "Error: no authorization code received")
+			_, _ = fmt.Fprintf(w, "Error: no authorization code received")
 			return
 		}
 		codeChan <- code
-		fmt.Fprintf(w, "Authorization successful! You can close this window.")
+		_, _ = fmt.Fprintf(w, "Authorization successful! You can close this window.")
 	}
 }
 
-// browserFlow opens a browser for OAuth authorization.
-func (m *Manager) browserFlow(ctx context.Context) (*oauth2.Token, error) {
+// browserFlow runs the OAuth authorization flow with a local callback server.
+// email is used as login_hint to pre-select the Google account.
+// If launchBrowser is false, the URL is printed without opening a browser.
+func (m *Manager) browserFlow(
+	ctx context.Context, email string, launchBrowser bool,
+) (*oauth2.Token, error) {
+	// Bail early if context is already cancelled — no point starting
+	// a server or opening a browser.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Generate random state for CSRF protection
 	stateBytes := make([]byte, 16)
 	if _, err := rand.Read(stateBytes); err != nil {
@@ -191,16 +260,29 @@ func (m *Manager) browserFlow(ctx context.Context) (*oauth2.Token, error) {
 
 	defer func() { _ = server.Shutdown(ctx) }()
 
-	// Generate auth URL
+	// Generate auth URL with login_hint to pre-select account
 	m.config.RedirectURL = "http://localhost:" + redirectPort + callbackPath
-	authURL := m.config.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
+	authOpts := []oauth2.AuthCodeOption{
+		oauth2.AccessTypeOffline,
+		oauth2.ApprovalForce,
+	}
+	if email != "" {
+		authOpts = append(authOpts,
+			oauth2.SetAuthURLParam("login_hint", email))
+	}
+	authURL := m.config.AuthCodeURL(state, authOpts...)
 
-	// Open browser
-	fmt.Printf("Opening browser for authorization...\n")
-	fmt.Printf("If browser doesn't open, visit:\n%s\n\n", authURL)
-
-	if err := openBrowser(authURL); err != nil {
-		m.logger.Warn("failed to open browser", "error", err)
+	if launchBrowser {
+		fmt.Printf("Opening browser for authorization...\n")
+		fmt.Printf("If browser doesn't open, visit:\n%s\n\n", authURL)
+		if err := openBrowser(authURL); err != nil {
+			m.logger.Warn("failed to open browser", "error", err)
+		}
+	} else {
+		fmt.Printf("\n=== Re-authorization required for %s ===\n\n", email)
+		fmt.Printf("Open this URL in your browser and select the account %s:\n\n", email)
+		fmt.Printf("  %s\n\n", authURL)
+		fmt.Printf("Waiting for authorization...\n")
 	}
 
 	// Wait for callback
@@ -214,12 +296,123 @@ func (m *Manager) browserFlow(ctx context.Context) (*oauth2.Token, error) {
 	}
 }
 
-// tokenFile wraps an OAuth2 token with metadata about the scopes it was
-// authorized with. This enables proactive scope checking (e.g., detecting
-// that deletion requires re-authorization) without making an API call first.
+const resolveTimeout = 10 * time.Second
+
+// resolveTokenEmail calls the Gmail profile API to confirm that
+// the token belongs to an account matching the expected email.
+// Returns the canonical (primary) Gmail address for the account,
+// which may differ from the input when the user supplies an alias
+// or secondary login address. The token is never persisted by this
+// function — the caller decides what to do on success or failure.
+func (m *Manager) resolveTokenEmail(
+	ctx context.Context, email string, token *oauth2.Token,
+) (string, error) {
+	valCtx, cancel := context.WithTimeout(ctx, resolveTimeout)
+	defer cancel()
+
+	ts := m.config.TokenSource(valCtx, token)
+	client := oauth2.NewClient(valCtx, ts)
+
+	profileURL := m.profileURL
+	if profileURL == "" {
+		profileURL = defaultProfileURL
+	}
+	req, err := http.NewRequestWithContext(valCtx, "GET", profileURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create profile request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf(
+			"could not verify token belongs to %s: %w "+
+				"(re-run the command to try again)", email, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf(
+			"could not verify token belongs to %s: "+
+				"Gmail API returned HTTP %d: %s "+
+				"(re-run the command to try again)",
+			email, resp.StatusCode, string(body))
+	}
+
+	var profile struct {
+		EmailAddress string `json:"emailAddress"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
+		return "", fmt.Errorf(
+			"could not verify token belongs to %s: "+
+				"failed to parse profile response: %w "+
+				"(re-run the command to try again)", email, err)
+	}
+
+	if !sameGoogleAccount(email, profile.EmailAddress) {
+		return "", &TokenMismatchError{
+			Expected: email,
+			Actual:   profile.EmailAddress,
+		}
+	}
+
+	return profile.EmailAddress, nil
+}
+
+// sameGoogleAccount returns true if two email addresses belong to the
+// same Google account. This covers the common alias cases:
+//   - exact match (case-insensitive)
+//   - gmail.com dot-insensitive (first.last@gmail.com == firstlast@gmail.com)
+//   - gmail.com plus-address (user+tag@gmail.com == user@gmail.com)
+//   - googlemail.com ↔ gmail.com equivalence
+//
+// For Google Workspace domains we cannot verify aliases without an
+// admin API call, so we fall back to exact-match only.
+func sameGoogleAccount(expected, canonical string) bool {
+	if strings.EqualFold(expected, canonical) {
+		return true
+	}
+
+	// Normalize gmail.com / googlemail.com addresses for comparison
+	expectedNorm := normalizeGmailAddress(expected)
+	canonicalNorm := normalizeGmailAddress(canonical)
+
+	return expectedNorm != "" && expectedNorm == canonicalNorm
+}
+
+// normalizeGmailAddress returns a canonical form of a gmail.com or
+// googlemail.com address by lowercasing, stripping +suffixes and dots
+// from the local part, and mapping googlemail.com → gmail.com.
+// Returns "" for non-Gmail addresses.
+func normalizeGmailAddress(email string) string {
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return ""
+	}
+	local := strings.ToLower(email[:at])
+	domain := strings.ToLower(email[at+1:])
+
+	if domain != "gmail.com" && domain != "googlemail.com" {
+		return ""
+	}
+
+	// Gmail ignores dots and +suffixes in the local part
+	if plus := strings.Index(local, "+"); plus >= 0 {
+		local = local[:plus]
+	}
+	local = strings.ReplaceAll(local, ".", "")
+	return local + "@gmail.com"
+}
+
+// tokenFile wraps an OAuth2 token with metadata about the scopes and
+// client it was authorized with. This enables proactive scope checking
+// (e.g., detecting that deletion requires re-authorization) and client
+// identity verification (detecting that an OAuth app switch requires
+// re-authorization) without making an API call first.
 type tokenFile struct {
 	oauth2.Token
-	Scopes []string `json:"scopes,omitempty"`
+	Scopes   []string `json:"scopes,omitempty"`
+	ClientID string   `json:"client_id,omitempty"`
 }
 
 // loadToken loads a saved token for the given email.
@@ -252,6 +445,21 @@ func (m *Manager) loadTokenFile(email string) (*tokenFile, error) {
 	}
 
 	return &tf, nil
+}
+
+// TokenMatchesClient returns true if the stored token for the given email
+// was minted by this manager's OAuth client. Returns false if the token
+// doesn't exist, has no client_id metadata (legacy token), or was minted
+// by a different client.
+func (m *Manager) TokenMatchesClient(email string) bool {
+	tf, err := m.loadTokenFile(email)
+	if err != nil {
+		return false
+	}
+	if tf.ClientID == "" {
+		return false // legacy token without client_id metadata
+	}
+	return tf.ClientID == m.config.ClientID
 }
 
 // HasScopeMetadata returns true if the token file for this account has any
@@ -287,8 +495,9 @@ func (m *Manager) saveToken(email string, token *oauth2.Token, scopes []string) 
 	}
 
 	tf := tokenFile{
-		Token:  *token,
-		Scopes: scopes,
+		Token:    *token,
+		Scopes:   scopes,
+		ClientID: m.config.ClientID,
 	}
 
 	data, err := json.MarshalIndent(tf, "", "  ")
@@ -308,20 +517,20 @@ func (m *Manager) saveToken(email string, token *oauth2.Token, scopes []string) 
 	tmpPath := tmpFile.Name()
 
 	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write temp token file: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close temp token file: %w", err)
 	}
 	if err := fileutil.SecureChmod(tmpPath, 0600); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("chmod temp token file: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp token file: %w", err)
 	}
 	return nil

@@ -13,7 +13,6 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"github.com/wesm/msgvault/internal/gmail"
-	imaplib "github.com/wesm/msgvault/internal/imap"
 	"github.com/wesm/msgvault/internal/oauth"
 	"github.com/wesm/msgvault/internal/store"
 	"github.com/wesm/msgvault/internal/sync"
@@ -47,7 +46,7 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 
 		if err := s.InitSchema(); err != nil {
 			return fmt.Errorf("init schema: %w", err)
@@ -66,22 +65,7 @@ Examples:
 			cancel()
 		}()
 
-		// Lazy OAuth init — only needed for Gmail sources.
-		var oauthMgr *oauth.Manager
-		getOAuthMgr := func() (*oauth.Manager, error) {
-			if oauthMgr != nil {
-				return oauthMgr, nil
-			}
-			if cfg.OAuth.ClientSecrets == "" {
-				return nil, errOAuthNotConfigured()
-			}
-			mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
-			if err != nil {
-				return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err))
-			}
-			oauthMgr = mgr
-			return oauthMgr, nil
-		}
+		getOAuthMgr := oauthManagerCache()
 
 		// Determine which accounts to sync.
 		type syncTarget struct {
@@ -95,7 +79,7 @@ Examples:
 		if len(args) == 1 {
 			// Resolve all sources for the identifier and route
 			// each by type, same as sync-full.
-			allMatches, lookupErr := s.GetSourcesByIdentifier(args[0])
+			allMatches, lookupErr := s.GetSourcesByIdentifierOrDisplayName(args[0])
 			if lookupErr != nil {
 				return fmt.Errorf("look up source: %w", lookupErr)
 			}
@@ -126,11 +110,11 @@ Examples:
 			for _, src := range allSources {
 				switch src.SourceType {
 				case "gmail":
-					if cfg.OAuth.ClientSecrets == "" {
+					if !cfg.OAuth.HasAnyConfig() {
 						fmt.Printf("Skipping %s (OAuth not configured)\n", src.Identifier)
 						continue
 					}
-					mgr, mgrErr := getOAuthMgr()
+					mgr, mgrErr := getOAuthMgr(sourceOAuthApp(src))
 					if mgrErr != nil {
 						syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, mgrErr))
 						continue
@@ -145,8 +129,13 @@ Examples:
 					}
 					gmailTargets = append(gmailTargets, syncTarget{source: src, email: src.Identifier})
 				case "imap":
-					if !imaplib.HasCredentials(cfg.TokensDir(), src.Identifier) {
-						fmt.Printf("Skipping %s (no credentials - run 'add-imap' first)\n", src.Identifier)
+					skipMsg, parseErr := imapSkipReason(src)
+					if parseErr != nil {
+						syncErrors = append(syncErrors, fmt.Sprintf("%s: malformed sync_config: %v", src.Identifier, parseErr))
+						continue
+					}
+					if skipMsg != "" {
+						fmt.Println(skipMsg)
 						continue
 					}
 					imapTargets = append(imapTargets, src)
@@ -169,7 +158,7 @@ Examples:
 				break
 			}
 			fmt.Printf("Note: IMAP account %s does not support incremental sync. Running full sync.\n\n", src.Identifier)
-			if err := runFullSync(ctx, s, nil, src); err != nil {
+			if err := runFullSync(ctx, s, getOAuthMgr, src); err != nil {
 				syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
 			}
 		}
@@ -183,16 +172,14 @@ Examples:
 				syncErrors = append(syncErrors, fmt.Sprintf("%s: no source found - run 'sync-full' first", target.email))
 				continue
 			}
-			mgr, mgrErr := getOAuthMgr()
-			if mgrErr != nil {
-				syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", target.email, mgrErr))
-				continue
-			}
-			if err := runIncrementalSync(ctx, s, mgr, target.source); err != nil {
+			if err := runIncrementalSync(ctx, s, getOAuthMgr, target.source); err != nil {
 				syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", target.email, err))
 				continue
 			}
 		}
+
+		// Rebuild analytics cache.
+		rebuildCacheAfterWrite(dbPath)
 
 		if len(syncErrors) > 0 {
 			fmt.Println()
@@ -208,9 +195,14 @@ Examples:
 	},
 }
 
-func runIncrementalSync(ctx context.Context, s *store.Store, oauthMgr *oauth.Manager, source *store.Source) error {
+func runIncrementalSync(ctx context.Context, s *store.Store, getOAuthMgr func(string) (*oauth.Manager, error), source *store.Source) error {
 	if !source.SyncCursor.Valid || source.SyncCursor.String == "" {
 		return fmt.Errorf("no history ID - run 'sync-full' first")
+	}
+
+	oauthMgr, err := getOAuthMgr(sourceOAuthApp(source))
+	if err != nil {
+		return err
 	}
 
 	email := source.Identifier
@@ -227,7 +219,7 @@ func runIncrementalSync(ctx context.Context, s *store.Store, oauthMgr *oauth.Man
 		gmail.WithLogger(logger),
 		gmail.WithRateLimiter(rateLimiter),
 	)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Set up sync options
 	opts := sync.DefaultOptions()

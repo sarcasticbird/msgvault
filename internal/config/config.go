@@ -79,18 +79,54 @@ type RemoteConfig struct {
 
 // Config represents the msgvault configuration.
 type Config struct {
-	Data     DataConfig        `toml:"data"`
-	OAuth    OAuthConfig       `toml:"oauth"`
-	Sync     SyncConfig        `toml:"sync"`
-	Chat     ChatConfig        `toml:"chat"`
-	Server   ServerConfig      `toml:"server"`
-	Remote   RemoteConfig      `toml:"remote"`
-	Accounts []AccountSchedule `toml:"accounts"`
-	Imports  []ImportSchedule  `toml:"imports"`
+	Data      DataConfig        `toml:"data"`
+	Log       LogConfig         `toml:"log"`
+	OAuth     OAuthConfig       `toml:"oauth"`
+	Microsoft MicrosoftConfig   `toml:"microsoft"`
+	Sync      SyncConfig        `toml:"sync"`
+	Chat      ChatConfig        `toml:"chat"`
+	Server    ServerConfig      `toml:"server"`
+	Remote    RemoteConfig      `toml:"remote"`
+	Accounts  []AccountSchedule `toml:"accounts"`
+	Imports   []ImportSchedule  `toml:"imports"`
 
 	// Computed paths (not from config file)
 	HomeDir    string `toml:"-"`
 	configPath string // resolved path to the loaded config file
+}
+
+// LogConfig holds logging configuration. File logging is opt-in:
+// set enabled = true or dir = "..." to write structured JSON logs
+// to disk. Without either, msgvault only writes to stderr (which
+// is the default behavior users already expect). The --log-file
+// CLI flag also enables file logging for a single run.
+type LogConfig struct {
+	// Dir is the directory where log files live. Empty means
+	// "<data dir>/logs". Setting this implicitly enables file
+	// logging.
+	Dir string `toml:"dir"`
+
+	// Level overrides the default logging level. Accepted values
+	// are "debug", "info", "warn", "error". Empty means "info"
+	// (or "debug" when --verbose is passed).
+	Level string `toml:"level"`
+
+	// Enabled turns on persistent file logging. When false (the
+	// default), the CLI only writes to stderr. Set to true, or
+	// set dir, to opt in to durable on-disk logs.
+	Enabled bool `toml:"enabled"`
+
+	// SQLSlowMs is the threshold above which any individual SQL
+	// query is logged at WARN regardless of the main level.
+	// Zero means "use the built-in default" (100 ms). Set to a
+	// very large value to effectively disable slow logging.
+	SQLSlowMs int64 `toml:"sql_slow_ms"`
+
+	// SQLTrace, when true, logs every SQL query at INFO level
+	// with statement text, arg count, duration, and error. This
+	// is voluminous — leave off in normal use and flip it on
+	// (via config or --log-sql) only when debugging.
+	SQLTrace bool `toml:"sql_trace"`
 }
 
 // DataConfig holds data storage configuration.
@@ -99,9 +135,66 @@ type DataConfig struct {
 	DatabaseURL string `toml:"database_url"`
 }
 
+// OAuthApp holds configuration for a named OAuth application.
+type OAuthApp struct {
+	ClientSecrets string `toml:"client_secrets"`
+}
+
 // OAuthConfig holds OAuth configuration.
 type OAuthConfig struct {
-	ClientSecrets string `toml:"client_secrets"`
+	ClientSecrets string              `toml:"client_secrets"`
+	Apps          map[string]OAuthApp `toml:"apps"`
+}
+
+// ClientSecretsFor returns the client secrets path for the given app name.
+// Empty name returns the default. Non-empty name looks up Apps[name].
+func (o *OAuthConfig) ClientSecretsFor(name string) (string, error) {
+	if name == "" {
+		if o.ClientSecrets == "" {
+			return "", fmt.Errorf("OAuth client secrets not configured.\n\n" +
+				"Set [oauth] client_secrets in config.toml, or use --oauth-app <name>")
+		}
+		return o.ClientSecrets, nil
+	}
+	app, ok := o.Apps[name]
+	if !ok {
+		return "", fmt.Errorf("OAuth app %q not configured. Add it to config.toml:\n\n"+
+			"  [oauth.apps.%s]\n"+
+			"  client_secrets = \"/path/to/client_secret.json\"", name, name)
+	}
+	if app.ClientSecrets == "" {
+		return "", fmt.Errorf("OAuth app %q has no client_secrets path configured", name)
+	}
+	return app.ClientSecrets, nil
+}
+
+// HasAnyConfig returns true if any OAuth configuration exists
+// (default or named apps).
+func (o *OAuthConfig) HasAnyConfig() bool {
+	if o.ClientSecrets != "" {
+		return true
+	}
+	for _, app := range o.Apps {
+		if app.ClientSecrets != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// MicrosoftConfig holds Microsoft 365 / Azure AD OAuth configuration.
+type MicrosoftConfig struct {
+	ClientID string `toml:"client_id"`
+	TenantID string `toml:"tenant_id"`
+}
+
+// EffectiveTenantID returns the tenant ID, defaulting to "common"
+// (multi-tenant, works for personal + org accounts).
+func (c *MicrosoftConfig) EffectiveTenantID() string {
+	if c.TenantID == "" {
+		return "common"
+	}
+	return c.TenantID
 }
 
 // SyncConfig holds sync-related configuration.
@@ -195,15 +288,20 @@ func Load(path, homeDir string) (*Config, error) {
 	if _, err := toml.DecodeFile(path, cfg); err != nil {
 		if strings.Contains(err.Error(), "invalid escape") ||
 			strings.Contains(err.Error(), "hexadecimal digits after") {
-			return nil, fmt.Errorf("decode config: %w\n\nhint: Windows paths in TOML must use "+
-				"forward slashes (C:/Games/msgvault) or single quotes ('C:\\Games\\msgvault').", err)
+			return nil, fmt.Errorf("decode config: %w -- hint: Windows paths in TOML must use "+
+				"forward slashes (C:/Games/msgvault) or single quotes ('C:\\Games\\msgvault')", err)
 		}
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 
 	// Expand ~ in paths
 	cfg.Data.DataDir = expandPath(cfg.Data.DataDir)
+	cfg.Log.Dir = expandPath(cfg.Log.Dir)
 	cfg.OAuth.ClientSecrets = expandPath(cfg.OAuth.ClientSecrets)
+	for name, app := range cfg.OAuth.Apps {
+		app.ClientSecrets = expandPath(app.ClientSecrets)
+		cfg.OAuth.Apps[name] = app
+	}
 	for i := range cfg.Imports {
 		cfg.Imports[i].Path = expandPath(cfg.Imports[i].Path)
 	}
@@ -212,7 +310,12 @@ func Load(path, homeDir string) (*Config, error) {
 	// directory so behavior doesn't depend on the working directory.
 	if explicit {
 		cfg.Data.DataDir = resolveRelative(cfg.Data.DataDir, cfg.HomeDir)
+		cfg.Log.Dir = resolveRelative(cfg.Log.Dir, cfg.HomeDir)
 		cfg.OAuth.ClientSecrets = resolveRelative(cfg.OAuth.ClientSecrets, cfg.HomeDir)
+		for name, app := range cfg.OAuth.Apps {
+			app.ClientSecrets = resolveRelative(app.ClientSecrets, cfg.HomeDir)
+			cfg.OAuth.Apps[name] = app
+		}
 	}
 
 	return cfg, nil
@@ -239,6 +342,15 @@ func (c *Config) TokensDir() string {
 // AnalyticsDir returns the path to the Parquet analytics directory.
 func (c *Config) AnalyticsDir() string {
 	return filepath.Join(c.Data.DataDir, "analytics")
+}
+
+// LogsDir returns the path to the logs directory. Uses [log].dir
+// from config when set; otherwise falls back to <data_dir>/logs.
+func (c *Config) LogsDir() string {
+	if c.Log.Dir != "" {
+		return c.Log.Dir
+	}
+	return filepath.Join(c.Data.DataDir, "logs")
 }
 
 // EnsureHomeDir creates the msgvault home directory if it doesn't exist.
@@ -290,8 +402,8 @@ func (c *Config) Save() error {
 	success := false
 	defer func() {
 		if !success {
-			tmp.Close()
-			os.Remove(tmpPath)
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 

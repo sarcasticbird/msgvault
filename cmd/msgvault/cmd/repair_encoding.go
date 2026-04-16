@@ -42,9 +42,26 @@ charset detection issues in the MIME parser.`,
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 
-		return repairEncoding(s)
+		if err := s.InitSchema(); err != nil {
+			return fmt.Errorf("init schema: %w", err)
+		}
+
+		if err := repairEncoding(s); err != nil {
+			return err
+		}
+
+		analyticsDir := cfg.AnalyticsDir()
+		if _, err := buildCache(dbPath, analyticsDir, true); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"Warning: cache rebuild failed: %v\n", err)
+			fmt.Fprintf(os.Stderr,
+				"Run 'msgvault build-cache --full-rebuild' to retry.\n")
+		} else {
+			fmt.Println("\nAnalytics cache rebuilt.")
+		}
+		return nil
 	},
 }
 
@@ -129,7 +146,6 @@ func repairEncoding(s *store.Store) error {
 		fmt.Printf("  Skipped rows:  %d (scan errors)\n", stats.skippedRows)
 	}
 	fmt.Printf("  Total fields:  %d\n", total)
-	fmt.Println("\nRun 'msgvault build-cache --full-rebuild' to update the analytics cache.")
 	return nil
 }
 
@@ -149,7 +165,7 @@ func repairMessageFields(s *store.Store, stats *repairStats) error {
 	if err != nil {
 		return fmt.Errorf("query messages: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type messageRepair struct {
 		id                                       int64
@@ -188,7 +204,9 @@ func repairMessageFields(s *store.Store, stats *repairStats) error {
 				msgArgs = append(msgArgs, r.id)
 				query := s.Rebind(fmt.Sprintf("UPDATE messages SET %s WHERE id = ?", strings.Join(msgUpdates, ", ")))
 				if _, err := tx.Exec(query, msgArgs...); err != nil {
-					_ = tx.Rollback()
+					if rbErr := tx.Rollback(); rbErr != nil {
+						logger.Warn("rollback failed", "error", rbErr)
+					}
 					return fmt.Errorf("update message %d: %w", r.id, err)
 				}
 			}
@@ -209,7 +227,9 @@ func repairMessageFields(s *store.Store, stats *repairStats) error {
 						body_text = COALESCE(excluded.body_text, message_bodies.body_text),
 						body_html = COALESCE(excluded.body_html, message_bodies.body_html)`)
 				if _, err := tx.Exec(query, r.id, bodyText, bodyHTML); err != nil {
-					_ = tx.Rollback()
+					if rbErr := tx.Rollback(); rbErr != nil {
+						logger.Warn("rollback failed", "error", rbErr)
+					}
 					return fmt.Errorf("upsert message_bodies %d: %w", r.id, err)
 				}
 			}
@@ -377,14 +397,18 @@ func repairDisplayNames(s *store.Store, stats *repairStats) error {
 
 			stmt, err := tx.Prepare(s.Rebind(table.updateStmt))
 			if err != nil {
-				_ = tx.Rollback()
+				if rbErr := tx.Rollback(); rbErr != nil {
+					logger.Warn("rollback failed", "error", rbErr)
+				}
 				return fmt.Errorf("prepare update: %w", err)
 			}
-			defer stmt.Close()
+			defer func() { _ = stmt.Close() }()
 
 			for _, r := range repairs {
 				if _, err := stmt.Exec(r.newName, r.id); err != nil {
-					_ = tx.Rollback()
+					if rbErr := tx.Rollback(); rbErr != nil {
+						logger.Warn("rollback failed", "error", rbErr)
+					}
 					return fmt.Errorf("update %s %d: %w", table.name, r.id, err)
 				}
 			}
@@ -419,7 +443,7 @@ func repairDisplayNames(s *store.Store, stats *repairStats) error {
 				// Apply batch when full
 				if len(repairs) >= batchSize {
 					if err := applyBatch(); err != nil {
-						rows.Close()
+						_ = rows.Close()
 						return err
 					}
 				}
@@ -427,10 +451,10 @@ func repairDisplayNames(s *store.Store, stats *repairStats) error {
 		}
 
 		if err := rows.Err(); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return fmt.Errorf("iterate %s: %w", table.name, err)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		// Apply remaining repairs
 		if err := applyBatch(); err != nil {
@@ -531,14 +555,18 @@ func repairOtherStrings(s *store.Store, stats *repairStats) error {
 
 			stmt, err := tx.Prepare(s.Rebind(table.updateStmt))
 			if err != nil {
-				_ = tx.Rollback()
+				if rbErr := tx.Rollback(); rbErr != nil {
+					logger.Warn("rollback failed", "error", rbErr)
+				}
 				return fmt.Errorf("prepare update: %w", err)
 			}
-			defer stmt.Close()
+			defer func() { _ = stmt.Close() }()
 
 			for _, r := range repairs {
 				if _, err := stmt.Exec(r.newValue, r.id); err != nil {
-					_ = tx.Rollback()
+					if rbErr := tx.Rollback(); rbErr != nil {
+						logger.Warn("rollback failed", "error", rbErr)
+					}
 					return fmt.Errorf("update %s %d: %w", table.name, r.id, err)
 				}
 			}
@@ -572,7 +600,7 @@ func repairOtherStrings(s *store.Store, stats *repairStats) error {
 
 				if len(repairs) >= batchSize {
 					if err := applyBatch(); err != nil {
-						rows.Close()
+						_ = rows.Close()
 						return err
 					}
 				}
@@ -580,10 +608,10 @@ func repairOtherStrings(s *store.Store, stats *repairStats) error {
 		}
 
 		if err := rows.Err(); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return fmt.Errorf("iterate %s: %w", table.name, err)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		if err := applyBatch(); err != nil {
 			return err
@@ -610,7 +638,7 @@ func tryParseMIME(rawData []byte, compression sql.NullString) *mime.Message {
 			return nil
 		}
 		rawData, err = io.ReadAll(r)
-		r.Close()
+		_ = r.Close()
 		if err != nil {
 			return nil
 		}

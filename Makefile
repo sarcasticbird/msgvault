@@ -12,7 +12,7 @@ LDFLAGS := -X github.com/wesm/msgvault/cmd/msgvault/cmd.Version=$(VERSION) \
 
 LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 
-.PHONY: build build-release install clean test test-v fmt lint tidy generate shootout run-shootout setup-hooks help
+.PHONY: build build-release install clean test test-v fmt lint lint-ci tidy generate shootout run-shootout install-hooks bench help
 
 # Generate templ templates
 generate:
@@ -46,7 +46,7 @@ install:
 
 # Clean build artifacts
 clean:
-	rm -f msgvault mimeshootout
+	rm -f msgvault msgvault.exe mimeshootout
 	rm -rf bin/
 
 # Run tests
@@ -61,19 +61,44 @@ test-v:
 fmt:
 	go fmt ./...
 
-# Run linter
+# Run linter (auto-fix)
 lint:
-	@which golangci-lint > /dev/null || (echo "Install golangci-lint: https://golangci-lint.run/usage/install/" && exit 1)
+	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+		echo "golangci-lint not found. Install: https://golangci-lint.run/usage/install/" >&2; \
+		exit 1; \
+	fi
+	golangci-lint run --fix ./...
+
+# Run linter (CI, no auto-fix)
+lint-ci:
+	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+		echo "golangci-lint not found. Install: https://golangci-lint.run/usage/install/" >&2; \
+		exit 1; \
+	fi
 	golangci-lint run ./...
 
-# Enable pre-commit hook (fmt + lint)
-setup-hooks:
-	git config core.hooksPath .githooks
-	@echo "Pre-commit hook enabled (.githooks/pre-commit)"
+# Install pre-commit hook via prek
+install-hooks:
+	@if ! command -v prek >/dev/null 2>&1; then \
+		echo "prek not found. Install with: brew install prek" >&2; \
+		exit 1; \
+	fi
+	@HOOKS_PATH=$$(git config --get core.hooksPath 2>/dev/null); \
+	if [ "$$HOOKS_PATH" = ".githooks" ]; then \
+		git config --unset core.hooksPath; \
+	elif [ -n "$$HOOKS_PATH" ]; then \
+		echo "core.hooksPath is set to '$$HOOKS_PATH' — unset it first if intended" >&2; \
+		exit 1; \
+	fi
+	prek install
 
 # Tidy dependencies
 tidy:
 	go mod tidy
+
+# Run benchmarks (query engine smoke test)
+bench:
+	go test -tags fts5 -run=^$$ -bench=. -benchtime=1s -count=1 ./internal/query/
 
 # Build the MIME shootout tool
 shootout:
@@ -95,10 +120,12 @@ help:
 	@echo "  test           - Run tests"
 	@echo "  test-v         - Run tests (verbose)"
 	@echo "  fmt            - Format code"
-	@echo "  lint           - Run linter"
+	@echo "  lint           - Run linter (auto-fix)"
+	@echo "  lint-ci        - Run linter (CI, no auto-fix)"
 	@echo "  tidy           - Tidy go.mod"
-	@echo "  setup-hooks    - Enable pre-commit hook (fmt + lint)"
+	@echo "  install-hooks  - Install pre-commit hook via prek"
 	@echo "  clean          - Remove build artifacts"
 	@echo ""
+	@echo "  bench          - Run query engine benchmarks"
 	@echo "  shootout       - Build MIME shootout tool"
 	@echo "  run-shootout   - Run MIME shootout"

@@ -46,19 +46,82 @@ func (q *Query) IsEmpty() bool {
 // operatorFn handles a parsed operator:value pair by applying it to the query.
 type operatorFn func(q *Query, value string, now time.Time)
 
+// normalizeAddr normalizes an address filter value. If it looks like a bare
+// domain (e.g. "example.com"), it is prefixed with "@" so downstream engines
+// treat it as a domain pattern. Dotted local parts like "john.doe" are left
+// unchanged because the suffix is not a recognized TLD.
+func normalizeAddr(v string) string {
+	v = strings.ToLower(v)
+	if !strings.Contains(v, "@") && looksLikeDomain(v) {
+		v = "@" + v
+	}
+	return v
+}
+
+// looksLikeDomain returns true if v appears to be a bare domain name
+// rather than a dotted local part. The value is treated as a domain
+// only when its suffix (after the last dot) is a recognized TLD.
+func looksLikeDomain(v string) bool {
+	dot := strings.LastIndex(v, ".")
+	if dot == -1 || dot == 0 || dot == len(v)-1 {
+		return false
+	}
+	return isKnownTLD(v[dot+1:])
+}
+
+// knownGTLDs contains common generic top-level domains (3+ chars).
+// Two-letter ccTLDs are handled separately by length check.
+// For unlisted TLDs, use the explicit @ prefix (e.g. from:@brand.pizza).
+var knownGTLDs = map[string]bool{
+	// Original gTLDs
+	"com": true, "org": true, "net": true,
+	"edu": true, "gov": true, "mil": true, "int": true,
+	// Early generic
+	"info": true, "biz": true, "name": true, "mobi": true,
+	// Popular new gTLDs (by registration volume)
+	"top": true, "xyz": true, "app": true, "dev": true,
+	"shop": true, "online": true, "site": true, "store": true,
+	"tech": true, "cloud": true, "blog": true, "space": true,
+	"click": true, "vip": true, "cfd": true,
+	// Business / professional
+	"agency": true, "business": true, "center": true,
+	"company": true, "digital": true, "email": true,
+	"media": true, "network": true, "services": true,
+	"solutions": true, "studio": true, "team": true,
+	"work": true, "world": true, "zone": true,
+	// Industry
+	"design": true, "events": true, "expert": true,
+	"finance": true, "health": true, "host": true,
+	"legal": true, "live": true, "marketing": true,
+	"news": true, "support": true, "trade": true, "web": true,
+	// Regional
+	"asia": true,
+}
+
+// isKnownTLD returns true if s matches a recognized top-level domain.
+// All 2-letter alphabetic strings are accepted as ccTLDs; longer
+// strings are checked against knownGTLDs.
+func isKnownTLD(s string) bool {
+	if len(s) == 2 {
+		return s[0] >= 'a' && s[0] <= 'z' &&
+			s[1] >= 'a' && s[1] <= 'z'
+	}
+	return knownGTLDs[s]
+}
+
 // operators maps operator names to their handler functions.
 var operators = map[string]operatorFn{
 	"from": func(q *Query, v string, _ time.Time) {
-		q.FromAddrs = append(q.FromAddrs, strings.ToLower(v))
+		q.FromAddrs = append(q.FromAddrs, normalizeAddr(v))
 	},
 	"to": func(q *Query, v string, _ time.Time) {
-		q.ToAddrs = append(q.ToAddrs, strings.ToLower(v))
+		q.ToAddrs = append(q.ToAddrs, normalizeAddr(v))
 	},
 	"cc": func(q *Query, v string, _ time.Time) {
-		q.CcAddrs = append(q.CcAddrs, strings.ToLower(v))
+		q.CcAddrs = append(q.CcAddrs, normalizeAddr(v))
 	},
 	"bcc": func(q *Query, v string, _ time.Time) {
-		q.BccAddrs = append(q.BccAddrs, strings.ToLower(v))
+		q.BccAddrs = append(q.BccAddrs, normalizeAddr(v))
 	},
 	"subject": func(q *Query, v string, _ time.Time) {
 		q.SubjectTerms = append(q.SubjectTerms, v)
@@ -240,6 +303,8 @@ func tokenize(queryStr string) []string {
 	}
 
 	if current.Len() > 0 {
+		// If we're still inside an unterminated quote, emit what we have
+		// as a plain token so the user's input is not silently dropped.
 		tokens = append(tokens, current.String())
 	}
 
@@ -292,6 +357,22 @@ func parseRelativeDate(value string, now time.Time) *time.Time {
 	}
 
 	return &result
+}
+
+// HasOperators returns true if the query contains any structured
+// operators beyond plain text terms.
+func (q *Query) HasOperators() bool {
+	return len(q.FromAddrs) > 0 ||
+		len(q.ToAddrs) > 0 ||
+		len(q.CcAddrs) > 0 ||
+		len(q.BccAddrs) > 0 ||
+		len(q.SubjectTerms) > 0 ||
+		len(q.Labels) > 0 ||
+		q.HasAttachment != nil ||
+		q.BeforeDate != nil ||
+		q.AfterDate != nil ||
+		q.LargerThan != nil ||
+		q.SmallerThan != nil
 }
 
 // parseSize parses size strings like 5M, 100K, 1G into bytes.

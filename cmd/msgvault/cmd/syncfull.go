@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/wesm/msgvault/internal/gmail"
 	imaplib "github.com/wesm/msgvault/internal/imap"
+	"github.com/wesm/msgvault/internal/microsoft"
 	"github.com/wesm/msgvault/internal/oauth"
 	"github.com/wesm/msgvault/internal/store"
 	"github.com/wesm/msgvault/internal/sync"
@@ -51,6 +52,16 @@ Examples:
 		if syncLimit < 0 {
 			return fmt.Errorf("--limit must be a non-negative number")
 		}
+		if syncAfter != "" {
+			if _, err := time.Parse("2006-01-02", syncAfter); err != nil {
+				return fmt.Errorf("invalid --after date %q (expected YYYY-MM-DD): %w", syncAfter, err)
+			}
+		}
+		if syncBefore != "" {
+			if _, err := time.Parse("2006-01-02", syncBefore); err != nil {
+				return fmt.Errorf("invalid --before date %q (expected YYYY-MM-DD): %w", syncBefore, err)
+			}
+		}
 
 		// Open database
 		dbPath := cfg.DatabaseDSN()
@@ -58,29 +69,13 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 
 		if err := s.InitSchema(); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
 
-		// oauthMgr is created lazily on first use so that IMAP-only users are
-		// not blocked by an absent client_secrets file.
-		var oauthMgr *oauth.Manager
-		getOAuthMgr := func() (*oauth.Manager, error) {
-			if oauthMgr != nil {
-				return oauthMgr, nil
-			}
-			if cfg.OAuth.ClientSecrets == "" {
-				return nil, errOAuthNotConfigured()
-			}
-			mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
-			if err != nil {
-				return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err))
-			}
-			oauthMgr = mgr
-			return oauthMgr, nil
-		}
+		getOAuthMgr := oauthManagerCache()
 
 		// Determine which sources to sync
 		var sources []*store.Source
@@ -90,7 +85,7 @@ Examples:
 			// keep only syncable types (gmail, imap). Non-syncable
 			// sources like mbox/apple-mail imports share the same
 			// identifier namespace but cannot be synced.
-			allMatches, err := s.GetSourcesByIdentifier(args[0])
+			allMatches, err := s.GetSourcesByIdentifierOrDisplayName(args[0])
 			if err != nil {
 				return fmt.Errorf("look up source: %w", err)
 			}
@@ -119,11 +114,11 @@ Examples:
 			for _, src := range allSources {
 				switch src.SourceType {
 				case "gmail":
-					if cfg.OAuth.ClientSecrets == "" {
+					if !cfg.OAuth.HasAnyConfig() {
 						fmt.Printf("Skipping %s (OAuth not configured)\n", src.Identifier)
 						continue
 					}
-					mgr, err := getOAuthMgr()
+					mgr, err := getOAuthMgr(sourceOAuthApp(src))
 					if err != nil {
 						syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
 						continue
@@ -133,8 +128,13 @@ Examples:
 						continue
 					}
 				case "imap":
-					if !imaplib.HasCredentials(cfg.TokensDir(), src.Identifier) {
-						fmt.Printf("Skipping %s (no credentials - run 'add-imap' first)\n", src.Identifier)
+					skipMsg, parseErr := imapSkipReason(src)
+					if parseErr != nil {
+						syncErrors = append(syncErrors, fmt.Sprintf("%s: malformed sync_config: %v", src.Identifier, parseErr))
+						continue
+					}
+					if skipMsg != "" {
+						fmt.Println(skipMsg)
 						continue
 					}
 				default:
@@ -170,17 +170,20 @@ Examples:
 
 			// Ensure the OAuth manager is initialized before syncing Gmail sources.
 			if src.SourceType == "gmail" || src.SourceType == "" {
-				if _, err := getOAuthMgr(); err != nil {
+				if _, err := getOAuthMgr(sourceOAuthApp(src)); err != nil {
 					syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
 					continue
 				}
 			}
 
-			if err := runFullSync(ctx, s, oauthMgr, src); err != nil {
+			if err := runFullSync(ctx, s, getOAuthMgr, src); err != nil {
 				syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
 				continue
 			}
 		}
+
+		// Rebuild analytics cache.
+		rebuildCacheAfterWrite(dbPath)
 
 		if len(syncErrors) > 0 {
 			fmt.Println()
@@ -197,9 +200,13 @@ Examples:
 }
 
 // buildAPIClient creates the appropriate gmail.API client for the given source.
-func buildAPIClient(ctx context.Context, src *store.Source, oauthMgr *oauth.Manager) (gmail.API, error) {
+func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(string) (*oauth.Manager, error)) (gmail.API, error) {
 	switch src.SourceType {
 	case "gmail", "":
+		oauthMgr, err := getOAuthMgr(sourceOAuthApp(src))
+		if err != nil {
+			return nil, err
+		}
 		interactive := isatty.IsTerminal(os.Stdin.Fd()) ||
 			isatty.IsCygwinTerminal(os.Stdin.Fd())
 		tokenSource, err := getTokenSourceWithReauth(ctx, oauthMgr, src.Identifier, interactive)
@@ -220,28 +227,75 @@ func buildAPIClient(ctx context.Context, src *store.Source, oauthMgr *oauth.Mana
 		if err != nil {
 			return nil, fmt.Errorf("parse IMAP config: %w", err)
 		}
-		password, err := imaplib.LoadCredentials(cfg.TokensDir(), src.Identifier)
-		if err != nil {
-			return nil, fmt.Errorf("load IMAP credentials: %w (run 'add-imap' first)", err)
+
+		var opts []imaplib.Option
+		opts = append(opts, imaplib.WithLogger(logger))
+
+		var since, before time.Time
+		if syncAfter != "" {
+			t, err := time.Parse("2006-01-02", syncAfter)
+			if err != nil {
+				return nil, fmt.Errorf("invalid --after date %q (expected YYYY-MM-DD): %w", syncAfter, err)
+			}
+			since = t
 		}
-		return imaplib.NewClient(imapCfg, password, imaplib.WithLogger(logger)), nil
+		if syncBefore != "" {
+			t, err := time.Parse("2006-01-02", syncBefore)
+			if err != nil {
+				return nil, fmt.Errorf("invalid --before date %q (expected YYYY-MM-DD): %w", syncBefore, err)
+			}
+			before = t
+		}
+		if !since.IsZero() || !before.IsZero() {
+			opts = append(opts, imaplib.WithDateFilter(since, before))
+		}
+
+		switch imapCfg.EffectiveAuthMethod() {
+		case imaplib.AuthXOAuth2:
+			if cfg.Microsoft.ClientID == "" {
+				return nil, fmt.Errorf("microsoft OAuth not configured — add a [microsoft] section with client_id to config.toml")
+			}
+			msMgr := microsoft.NewManager(
+				cfg.Microsoft.ClientID,
+				cfg.Microsoft.EffectiveTenantID(),
+				cfg.TokensDir(),
+				logger,
+			)
+			tokenFn, err := msMgr.TokenSource(ctx, imapCfg.Username)
+			if err != nil {
+				return nil, fmt.Errorf("load Microsoft token: %w (run 'add-o365' first)", err)
+			}
+			opts = append(opts, imaplib.WithTokenSource(tokenFn))
+			return imaplib.NewClient(imapCfg, "", opts...), nil
+		default:
+			password, err := imaplib.LoadCredentials(cfg.TokensDir(), src.Identifier)
+			if err != nil {
+				return nil, fmt.Errorf("load IMAP credentials: %w (run 'add-imap' first)", err)
+			}
+			return imaplib.NewClient(imapCfg, password, opts...), nil
+		}
 
 	default:
 		return nil, fmt.Errorf("unsupported source type %q", src.SourceType)
 	}
 }
 
-func runFullSync(ctx context.Context, s *store.Store, oauthMgr *oauth.Manager, src *store.Source) error {
-	apiClient, err := buildAPIClient(ctx, src, oauthMgr)
+func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(string) (*oauth.Manager, error), src *store.Source) error {
+	apiClient, err := buildAPIClient(ctx, src, getOAuthMgr)
 	if err != nil {
 		return err
 	}
-	defer apiClient.Close()
+	defer func() { _ = apiClient.Close() }()
 
-	// Build query from flags (Gmail only).
+	// Build query from flags (Gmail only; IMAP date filters are
+	// handled via WithDateFilter on the client).
 	query := buildSyncQuery()
 	if query != "" && src.SourceType == "imap" {
-		fmt.Printf("Warning: --query/--before/--after are not supported for IMAP sources and will be ignored.\n\n")
+		// --after/--before are handled natively by IMAP SEARCH;
+		// only warn about --query which has no IMAP equivalent.
+		if syncQuery != "" {
+			fmt.Printf("Warning: --query is not supported for IMAP sources and will be ignored.\n\n")
+		}
 		query = ""
 	}
 
@@ -269,7 +323,11 @@ func runFullSync(ctx context.Context, s *store.Store, oauthMgr *oauth.Manager, s
 
 	// Run sync
 	startTime := time.Now()
-	fmt.Printf("Starting full sync for %s\n", src.Identifier)
+	displayID := src.Identifier
+	if src.DisplayName.Valid && src.DisplayName.String != "" {
+		displayID = src.DisplayName.String
+	}
+	fmt.Printf("Starting full sync for %s\n", displayID)
 	if query != "" && src.SourceType != "imap" {
 		fmt.Printf("Query: %s\n", query)
 	}
@@ -310,7 +368,7 @@ func runFullSync(ctx context.Context, s *store.Store, oauthMgr *oauth.Manager, s
 
 	elapsed := time.Since(startTime)
 	logger.Info("sync completed",
-		"identifier", src.Identifier,
+		"identifier", displayID,
 		"messages_added", summary.MessagesAdded,
 		"elapsed", elapsed,
 	)
@@ -432,6 +490,44 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm %ds", m, s)
 	}
 	return fmt.Sprintf("%ds", s)
+}
+
+// imapSkipReason checks whether an IMAP source has the credentials needed to
+// sync. Return values:
+//   - ("", nil)     — credentials present, source is ready
+//   - ("msg", nil)  — credentials absent; print the message and skip
+//   - ("", err)     — sync_config is malformed; add to the error list
+func imapSkipReason(src *store.Source) (string, error) {
+	if !src.SyncConfig.Valid || src.SyncConfig.String == "" {
+		if !imaplib.HasCredentials(cfg.TokensDir(), src.Identifier) {
+			return fmt.Sprintf("Skipping %s (no credentials — run 'add-imap' or 'add-o365' first)", src.Identifier), nil
+		}
+		return "", nil
+	}
+	imapCfg, err := imaplib.ConfigFromJSON(src.SyncConfig.String)
+	if err != nil {
+		return "", err
+	}
+	switch imapCfg.EffectiveAuthMethod() {
+	case imaplib.AuthXOAuth2:
+		if cfg.Microsoft.ClientID == "" {
+			return fmt.Sprintf("Skipping %s (Microsoft OAuth not configured — add client_id to [microsoft] in config.toml)", src.Identifier), nil
+		}
+		msMgr := microsoft.NewManager(
+			cfg.Microsoft.ClientID,
+			cfg.Microsoft.EffectiveTenantID(),
+			cfg.TokensDir(),
+			logger,
+		)
+		if !msMgr.HasToken(imapCfg.Username) {
+			return fmt.Sprintf("Skipping %s (no Microsoft token — run 'add-o365' first)", src.Identifier), nil
+		}
+	default:
+		if !imaplib.HasCredentials(cfg.TokensDir(), src.Identifier) {
+			return fmt.Sprintf("Skipping %s (no credentials — run 'add-imap' first)", src.Identifier), nil
+		}
+	}
+	return "", nil
 }
 
 func init() {

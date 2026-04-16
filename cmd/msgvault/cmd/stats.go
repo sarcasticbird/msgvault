@@ -18,12 +18,21 @@ Use --local to force local database.`,
 		if err != nil {
 			return fmt.Errorf("open store: %w", err)
 		}
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 
 		stats, err := s.GetStats()
 		if err != nil {
+			logger.Warn("stats failed", "error", err.Error())
 			return fmt.Errorf("get stats: %w", err)
 		}
+		logger.Info("stats",
+			"messages", stats.MessageCount,
+			"threads", stats.ThreadCount,
+			"attachments", stats.AttachmentCount,
+			"labels", stats.LabelCount,
+			"accounts", stats.SourceCount,
+			"db_bytes", stats.DatabaseSize,
+		)
 
 		// Show source indicator
 		if IsRemoteMode() {

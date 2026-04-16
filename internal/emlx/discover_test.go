@@ -144,8 +144,9 @@ func TestDiscoverMailboxes_PartialEmlxSkipped(t *testing.T) {
 		t.Fatalf("Files = %d, want 1 (partial should be skipped)",
 			len(mailboxes[0].Files))
 	}
-	if mailboxes[0].Files[0] != "1.emlx" {
-		t.Fatalf("Files[0] = %q, want %q", mailboxes[0].Files[0], "1.emlx")
+	if filepath.Base(mailboxes[0].Files[0]) != "1.emlx" {
+		t.Fatalf("Files[0] basename = %q, want %q",
+			filepath.Base(mailboxes[0].Files[0]), "1.emlx")
 	}
 }
 
@@ -258,14 +259,15 @@ func TestDiscoverMailboxes_FilesSorted(t *testing.T) {
 		t.Fatalf("got %d mailboxes, want 1", len(mailboxes))
 	}
 
-	want := []string{"1.emlx", "10.emlx", "2.emlx", "300.emlx"}
+	wantNames := []string{"1.emlx", "10.emlx", "2.emlx", "300.emlx"}
 	files := mailboxes[0].Files
-	if len(files) != len(want) {
-		t.Fatalf("files = %v, want %v", files, want)
+	if len(files) != len(wantNames) {
+		t.Fatalf("files count = %d, want %d", len(files), len(wantNames))
 	}
-	for i := range want {
-		if files[i] != want[i] {
-			t.Fatalf("files[%d] = %q, want %q", i, files[i], want[i])
+	for i := range wantNames {
+		got := filepath.Base(files[i])
+		if got != wantNames[i] {
+			t.Fatalf("files[%d] basename = %q, want %q", i, got, wantNames[i])
 		}
 	}
 }
@@ -382,9 +384,9 @@ func TestDiscoverMailboxes_V10PartialSkipped(t *testing.T) {
 	if len(mailboxes[0].Files) != 1 {
 		t.Fatalf("Files = %d, want 1", len(mailboxes[0].Files))
 	}
-	if mailboxes[0].Files[0] != "1.emlx" {
-		t.Errorf("Files[0] = %q, want %q",
-			mailboxes[0].Files[0], "1.emlx")
+	if filepath.Base(mailboxes[0].Files[0]) != "1.emlx" {
+		t.Errorf("Files[0] basename = %q, want %q",
+			filepath.Base(mailboxes[0].Files[0]), "1.emlx")
 	}
 }
 
@@ -475,39 +477,24 @@ func TestDiscoverMailboxes_V10Partitioned(t *testing.T) {
 		t.Fatalf("Files = %v (len %d), want 3 files", mb.Files, len(mb.Files))
 	}
 
-	// Verify all expected filenames are present.
-	fileSet := make(map[string]bool)
+	// Verify all paths are absolute and point to existing files.
+	for _, path := range mb.Files {
+		if !filepath.IsAbs(path) {
+			t.Errorf("expected absolute path, got %q", path)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("stat %q: %v", path, err)
+		}
+	}
+
+	// Verify expected basenames are present.
+	baseNames := make(map[string]bool)
 	for _, f := range mb.Files {
-		fileSet[f] = true
+		baseNames[filepath.Base(f)] = true
 	}
 	for _, want := range []string{"1.emlx", "123.emlx", "456.emlx"} {
-		if !fileSet[want] {
-			t.Errorf("missing file %q in Files: %v", want, mb.Files)
-		}
-	}
-
-	// Verify FilePath resolves to an existing file for each entry.
-	for _, fileName := range mb.Files {
-		path := mb.FilePath(fileName)
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("FilePath(%q) = %q: stat failed: %v", fileName, path, err)
-		}
-	}
-
-	// Top-level file should NOT be in FileIndex.
-	if mb.FileIndex != nil {
-		if _, inIndex := mb.FileIndex["1.emlx"]; inIndex {
-			t.Errorf("top-level 1.emlx should not be in FileIndex")
-		}
-	}
-
-	// Partition files should be in FileIndex.
-	if mb.FileIndex == nil {
-		t.Fatal("FileIndex is nil but partition files were found")
-	}
-	for _, pf := range []string{"123.emlx", "456.emlx"} {
-		if _, ok := mb.FileIndex[pf]; !ok {
-			t.Errorf("partition file %q missing from FileIndex", pf)
+		if !baseNames[want] {
+			t.Errorf("missing file %q in Files", want)
 		}
 	}
 }
@@ -549,10 +536,9 @@ func TestDiscoverMailboxes_V10PartitionedOnly(t *testing.T) {
 		t.Fatalf("Files = %v (len %d), want 2", mb.Files, len(mb.Files))
 	}
 
-	for _, fileName := range mb.Files {
-		path := mb.FilePath(fileName)
+	for _, path := range mb.Files {
 		if _, err := os.Stat(path); err != nil {
-			t.Errorf("FilePath(%q) = %q: stat failed: %v", fileName, path, err)
+			t.Errorf("stat %q: %v", path, err)
 		}
 	}
 }
@@ -574,12 +560,12 @@ func TestDiscoverMailboxes_V10NoTopLevelMessages(t *testing.T) {
 			t.Fatalf("mkdir %q: %v", partPath, err)
 		}
 	}
-	files := map[string]string{
+	testFiles := map[string]string{
 		"500.emlx": filepath.Join(mboxDir, guid, "Data", "9", "9", "Messages"),
 		"600.emlx": filepath.Join(mboxDir, guid, "Data", "0", "0", "1", "Messages"),
 		"700.emlx": filepath.Join(mboxDir, guid, "Data", "0", "0", "1", "Messages"),
 	}
-	for name, dir := range files {
+	for name, dir := range testFiles {
 		path := filepath.Join(dir, name)
 		if err := os.WriteFile(path, []byte("10\nFrom: x\r\n\r\n"), 0600); err != nil {
 			t.Fatalf("write %q: %v", path, err)
@@ -599,10 +585,9 @@ func TestDiscoverMailboxes_V10NoTopLevelMessages(t *testing.T) {
 		t.Fatalf("Files = %v, want 3", mb.Files)
 	}
 
-	for _, fileName := range mb.Files {
-		path := mb.FilePath(fileName)
+	for _, path := range mb.Files {
 		if _, err := os.Stat(path); err != nil {
-			t.Errorf("FilePath(%q) = %q: stat failed: %v", fileName, path, err)
+			t.Errorf("stat %q: %v", path, err)
 		}
 	}
 }

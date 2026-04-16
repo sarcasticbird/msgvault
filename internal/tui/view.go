@@ -6,12 +6,13 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/wesm/msgvault/internal/query"
+	"github.com/wesm/msgvault/internal/textutil"
 )
 
-// Monochrome theme - adaptive for light and dark terminals
+// Monochrome theme - inherits terminal background where possible.
+// Only cursor, title bar, and alt rows use explicit backgrounds.
 var (
-	// Background colors - adaptive for light/dark terminals
-	bgBase   = lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#000000"}
+	// Explicit backgrounds only for elements that need contrast
 	bgAlt    = lipgloss.AdaptiveColor{Light: "#f0f0f0", Dark: "#181818"}
 	bgCursor = lipgloss.AdaptiveColor{Light: "#e0e0e0", Dark: "#282828"}
 
@@ -24,52 +25,43 @@ var (
 
 	statsStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.AdaptiveColor{Light: "#555555", Dark: "#999999"}).
-			Background(bgBase).
 			Padding(0, 1)
 
 	// Spinner style - NOT faint so it's visible
 	spinnerStyle = lipgloss.NewStyle().
-			Bold(true).
-			Background(bgBase)
+			Bold(true)
 
 	tableHeaderStyle = lipgloss.NewStyle().
-				Bold(true).
-				Background(bgBase)
+				Bold(true)
 
 	// Separator line style for under headers
 	separatorStyle = lipgloss.NewStyle().
-			Faint(true).
-			Background(bgBase)
+			Faint(true)
 
-	// Cursor row: subtle lighter background
+	// Cursor row: subtle background for visibility
 	cursorRowStyle = lipgloss.NewStyle().
 			Background(bgCursor)
 
-	// Selected (checked) rows: bold
+	// Selected (checked) rows: bold, inherits terminal background
 	selectedRowStyle = lipgloss.NewStyle().
-				Bold(true).
-				Background(bgBase)
+				Bold(true)
 
-	// Normal rows need background to clear old content
-	normalRowStyle = lipgloss.NewStyle().
-			Background(bgBase)
+	// Normal rows inherit terminal background
+	normalRowStyle = lipgloss.NewStyle()
 
-	// Alternating rows: very subtle gray background
+	// Alternating rows: very subtle shift from terminal default
 	altRowStyle = lipgloss.NewStyle().
 			Background(bgAlt)
 
 	footerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.AdaptiveColor{Light: "#555555", Dark: "#999999"}).
-			Background(bgBase).
 			Padding(0, 1)
 
 	errorStyle = lipgloss.NewStyle().
-			Bold(true).
-			Background(bgBase)
+			Bold(true)
 
 	loadingStyle = lipgloss.NewStyle().
-			Italic(true).
-			Background(bgBase)
+			Italic(true)
 
 	selectedIndicatorStyle = lipgloss.NewStyle().
 				Bold(true)
@@ -77,15 +69,14 @@ var (
 	modalStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			Padding(1, 2).
-			Background(bgBase)
+			Background(lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#000000"})
 
 	modalTitleStyle = lipgloss.NewStyle().
 			Bold(true)
 
 	flashStyle = lipgloss.NewStyle().
 			Italic(true).
-			Foreground(lipgloss.AdaptiveColor{Light: "#996600", Dark: "#ffcc00"}). // Amber for visibility
-			Background(bgBase)
+			Foreground(lipgloss.AdaptiveColor{Light: "#996600", Dark: "#ffcc00"}) // Amber for visibility
 
 	highlightStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.AdaptiveColor{Light: "#000000", Dark: "#000000"}).
@@ -181,8 +172,14 @@ func (m Model) buildTitleBar() string {
 		}
 	}
 
-	// Build line content: "msgvault [hash] - Account          update: vX.Y.Z"
-	line1Content := fmt.Sprintf("%s - %s", titleText, accountStr)
+	// Mode indicator when text engine is available
+	modeStr := ""
+	if m.textEngine != nil {
+		modeStr = " [Email]"
+	}
+
+	// Build line content: "msgvault [hash] [Email] - Account          update: vX.Y.Z"
+	line1Content := fmt.Sprintf("%s%s - %s", titleText, modeStr, accountStr)
 	if updateNotice != "" {
 		gap := m.width - 2 - lipgloss.Width(line1Content) - lipgloss.Width(updateNotice)
 		if gap > 1 {
@@ -289,7 +286,25 @@ func (m Model) headerView() string {
 // aggregateTableView renders the aggregate data table.
 func (m Model) aggregateTableView() string {
 	if len(m.rows) == 0 && !m.loading && !m.inlineSearchActive && m.searchQuery == "" && m.err == nil {
-		return m.fillScreen(normalRowStyle.Render(padRight("No data", m.width)), 1)
+		var sb strings.Builder
+		sb.WriteString(tableHeaderStyle.Render(padRight("   "+viewTypeAbbrev(m.viewType), m.width)))
+		sb.WriteString("\n")
+		sb.WriteString(separatorStyle.Render(strings.Repeat("\u2500", m.width)))
+		sb.WriteString("\n")
+		sb.WriteString(normalRowStyle.Render(padRight("   No data", m.width)))
+		sb.WriteString("\n")
+		// 1 "No data" + (pageSize-2) blanks = pageSize-1 data rows,
+		// then +1 info line = pageSize body rows total.
+		for i := 1; i < m.pageSize-1; i++ {
+			sb.WriteString(normalRowStyle.Render(strings.Repeat(" ", m.width)))
+			sb.WriteString("\n")
+		}
+		sb.WriteString(m.renderInfoLine("", m.loading))
+		s := sb.String()
+		if m.modal != modalNone {
+			return m.overlayModal(s)
+		}
+		return s
 	}
 
 	var sb strings.Builder
@@ -527,16 +542,34 @@ func (m Model) messageListView() string {
 		date := msg.SentAt.Format("2006-01-02 15:04")
 
 		// Format from (rune-aware for international names)
-		from := msg.FromEmail
+		// Sanitize untrusted metadata to prevent terminal control-sequence injection.
+		from := textutil.SanitizeTerminal(msg.FromEmail)
 		if msg.FromName != "" {
-			from = msg.FromName
+			from = textutil.SanitizeTerminal(msg.FromName)
+		}
+		// For chat messages: fall back to phone number, then group title
+		if from == "" && msg.FromPhone != "" {
+			from = textutil.SanitizeTerminal(msg.FromPhone)
+		}
+		if from == "" && msg.ConversationTitle != "" {
+			from = textutil.SanitizeTerminal(msg.ConversationTitle)
 		}
 		from = truncateRunes(from, fromWidth)
 		from = fmt.Sprintf("%-*s", fromWidth, from)
 		from = highlightTerms(from, m.searchQuery)
 
 		// Format subject with indicators (rune-aware)
-		subject := msg.Subject
+		// For chat messages without a subject, show snippet or group title
+		subject := textutil.SanitizeTerminal(msg.Subject)
+		if subject == "" && msg.MessageType == "whatsapp" {
+			title := textutil.SanitizeTerminal(msg.ConversationTitle)
+			snippet := textutil.SanitizeTerminal(msg.Snippet)
+			if title != "" {
+				subject = title + ": " + snippet
+			} else {
+				subject = snippet
+			}
+		}
 		if msg.DeletedAt != nil {
 			subject = "🗑 " + subject // Deleted from server indicator
 		}
@@ -878,12 +911,19 @@ func (m Model) threadView() string {
 		dateStr := msg.SentAt.Format("2006-01-02 15:04")
 
 		// Format from/subject with deleted indicator
-		fromSubject := msg.FromEmail
+		// Sanitize untrusted metadata to prevent terminal control-sequence injection.
+		fromSubject := textutil.SanitizeTerminal(msg.FromEmail)
 		if msg.FromName != "" {
-			fromSubject = msg.FromName
+			fromSubject = textutil.SanitizeTerminal(msg.FromName)
+		}
+		// For chat messages: fall back to phone number
+		if fromSubject == "" && msg.FromPhone != "" {
+			fromSubject = textutil.SanitizeTerminal(msg.FromPhone)
 		}
 		if msg.Subject != "" {
-			fromSubject = truncateRunes(fromSubject, 18) + ": " + msg.Subject
+			fromSubject = truncateRunes(fromSubject, 18) + ": " + textutil.SanitizeTerminal(msg.Subject)
+		} else if msg.MessageType == "whatsapp" && msg.Snippet != "" {
+			fromSubject = truncateRunes(fromSubject, 18) + ": " + textutil.SanitizeTerminal(msg.Snippet)
 		}
 		if msg.DeletedAt != nil {
 			fromSubject = "🗑 " + fromSubject // Deleted from server indicator
@@ -1172,6 +1212,7 @@ var rawHelpLines = []string{
 	"  A           Select account",
 	"  f           Filter (attachments, deleted)",
 	"  e           Export attachments (in message view)",
+	"  m           Toggle Email/Texts mode",
 	"  q           Quit",
 	"",
 	"[↑/↓] Scroll  [Any other key] Close",
@@ -1197,7 +1238,7 @@ func (m Model) renderDeleteConfirmModal() string {
 	var sb strings.Builder
 	sb.WriteString(modalTitleStyle.Render("Confirm Deletion"))
 	sb.WriteString("\n\n")
-	sb.WriteString(fmt.Sprintf("Stage %d messages for deletion?\n\n", len(m.pendingManifest.GmailIDs)))
+	_, _ = fmt.Fprintf(&sb, "Stage %d messages for deletion?\n\n", len(m.pendingManifest.GmailIDs))
 	sb.WriteString("This creates a deletion batch. Messages will NOT be\n")
 	sb.WriteString("deleted until you run 'msgvault delete-staged'.\n\n")
 	if m.pendingManifest.Filters.Account == "" {
@@ -1231,14 +1272,14 @@ func (m Model) renderAccountSelectorModal() string {
 	if m.modalCursor == 0 {
 		indicator = "●"
 	}
-	sb.WriteString(fmt.Sprintf(" %s All Accounts\n", indicator))
+	_, _ = fmt.Fprintf(&sb, " %s All Accounts\n", indicator)
 	// Individual accounts
 	for i, acc := range m.accounts {
 		indicator = "○"
 		if m.modalCursor == i+1 {
 			indicator = "●"
 		}
-		sb.WriteString(fmt.Sprintf(" %s %s\n", indicator, acc.Identifier))
+		_, _ = fmt.Fprintf(&sb, " %s %s\n", indicator, acc.Identifier)
 	}
 	sb.WriteString("\n[↑/↓] Navigate  [Enter] Select  [Esc] Cancel")
 	return sb.String()
@@ -1268,7 +1309,7 @@ func (m Model) renderFilterModal() string {
 		if opt.checked {
 			checkbox = "[x]"
 		}
-		sb.WriteString(fmt.Sprintf("%s%s %s\n", cursor, checkbox, opt.label))
+		_, _ = fmt.Fprintf(&sb, "%s%s %s\n", cursor, checkbox, opt.label)
 	}
 
 	sb.WriteString("\n[↑/↓] Navigate  [Space/x] Toggle  [Enter/Esc] Apply")
@@ -1321,7 +1362,7 @@ func (m Model) renderExportAttachmentsModal() string {
 		if m.exportSelection[i] {
 			checkbox = "☑"
 		}
-		sb.WriteString(fmt.Sprintf("%s %s %s (%s)\n", cursor, checkbox, att.Filename, formatBytes(att.Size)))
+		_, _ = fmt.Fprintf(&sb, "%s %s %s (%s)\n", cursor, checkbox, att.Filename, formatBytes(att.Size))
 	}
 	// Count selected
 	selectedCount := 0
@@ -1330,7 +1371,7 @@ func (m Model) renderExportAttachmentsModal() string {
 			selectedCount++
 		}
 	}
-	sb.WriteString(fmt.Sprintf("\n%d of %d selected\n", selectedCount, len(m.messageDetail.Attachments)))
+	_, _ = fmt.Fprintf(&sb, "\n%d of %d selected\n", selectedCount, len(m.messageDetail.Attachments))
 	sb.WriteString("\n[↑/↓] Navigate  [Space] Toggle  [a] All  [n] None\n")
 	sb.WriteString("[Enter] Export  [Esc] Cancel")
 	return sb.String()

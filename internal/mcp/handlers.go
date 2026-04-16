@@ -83,7 +83,7 @@ func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("attachment file not available: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
 	if err != nil {
@@ -284,11 +284,11 @@ func (h *handlers) exportAttachment(ctx context.Context, req mcp.CallToolRequest
 	_, writeErr := f.Write(data)
 	closeErr := f.Close()
 	if writeErr != nil {
-		os.Remove(outPath)
+		_ = os.Remove(outPath)
 		return mcp.NewToolResultError(fmt.Sprintf("write failed: %v", writeErr)), nil
 	}
 	if closeErr != nil {
-		os.Remove(outPath)
+		_ = os.Remove(outPath)
 		return mcp.NewToolResultError(fmt.Sprintf("write failed: %v", closeErr)), nil
 	}
 
@@ -323,7 +323,12 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 
 	if v, ok := args["from"].(string); ok && v != "" {
-		filter.Sender = v
+		// If it looks like an email address, filter by email; otherwise by display name.
+		if strings.Contains(v, "@") || strings.HasPrefix(v, "+") {
+			filter.Sender = v
+		} else {
+			filter.SenderName = v
+		}
 	}
 	if v, ok := args["to"].(string); ok && v != "" {
 		filter.Recipient = v

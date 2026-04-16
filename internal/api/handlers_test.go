@@ -1,17 +1,21 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/wesm/msgvault/internal/config"
+	"github.com/wesm/msgvault/internal/query"
+	"github.com/wesm/msgvault/internal/query/querytest"
 )
 
 func newTestServerWithMockStore(t *testing.T) (*Server, *mockStore) {
@@ -373,13 +377,113 @@ func TestMessageSummaryNilSlices(t *testing.T) {
 	}
 }
 
+func TestMessageSummaryCcBccInResponse(t *testing.T) {
+	srv, ms := newTestServerWithMockStore(t)
+	ms.messages[0].Cc = []string{"cc1@example.com", "cc2@example.com"}
+	ms.messages[0].Bcc = []string{"bcc@example.com"}
+
+	req := httptest.NewRequest("GET", "/api/v1/messages", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	msg := resp["messages"].([]interface{})[0].(map[string]interface{})
+
+	ccRaw, ok := msg["cc"].([]interface{})
+	if !ok {
+		t.Fatalf("expected 'cc' array, got %T", msg["cc"])
+	}
+	var gotCc []string
+	for _, v := range ccRaw {
+		gotCc = append(gotCc, v.(string))
+	}
+	slices.Sort(gotCc)
+	wantCc := []string{"cc1@example.com", "cc2@example.com"}
+	if !slices.Equal(gotCc, wantCc) {
+		t.Errorf("cc = %v, want %v", gotCc, wantCc)
+	}
+
+	bcc, ok := msg["bcc"].([]interface{})
+	if !ok {
+		t.Fatalf("expected 'bcc' array, got %T", msg["bcc"])
+	}
+	if len(bcc) != 1 || bcc[0] != "bcc@example.com" {
+		t.Errorf("bcc = %v, want [bcc@example.com]", bcc)
+	}
+}
+
+func TestMessageSummaryCcBccOmittedWhenEmpty(t *testing.T) {
+	srv, _ := newTestServerWithMockStore(t)
+
+	req := httptest.NewRequest("GET", "/api/v1/messages", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	// Parse raw JSON to check field presence
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var messages []json.RawMessage
+	if err := json.Unmarshal(raw["messages"], &messages); err != nil {
+		t.Fatalf("decode messages: %v", err)
+	}
+
+	var msg map[string]json.RawMessage
+	if err := json.Unmarshal(messages[0], &msg); err != nil {
+		t.Fatalf("decode message: %v", err)
+	}
+
+	if _, exists := msg["cc"]; exists {
+		t.Error("expected 'cc' to be omitted from JSON when empty")
+	}
+	if _, exists := msg["bcc"]; exists {
+		t.Error("expected 'bcc' to be omitted from JSON when empty")
+	}
+}
+
+func TestGetMessageCcBccInResponse(t *testing.T) {
+	srv, ms := newTestServerWithMockStore(t)
+	ms.messages[0].Cc = []string{"cc@example.com"}
+	ms.messages[0].Bcc = []string{"bcc@example.com"}
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/1", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var resp MessageDetail
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(resp.Cc) != 1 || resp.Cc[0] != "cc@example.com" {
+		t.Errorf("cc = %v, want [cc@example.com]", resp.Cc)
+	}
+	if len(resp.Bcc) != 1 || resp.Bcc[0] != "bcc@example.com" {
+		t.Errorf("bcc = %v, want [bcc@example.com]", resp.Bcc)
+	}
+}
+
 func TestHandleUploadToken(t *testing.T) {
 	// Create temp directory for tokens
 	tmpDir, err := os.MkdirTemp("", "msgvault-test-tokens-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	cfg := &config.Config{
 		Server: config.ServerConfig{APIPort: 8080},
@@ -412,12 +516,61 @@ func TestHandleUploadToken(t *testing.T) {
 	}
 }
 
+func TestHandleUploadToken_PreservesClientID(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "msgvault-test-tokens-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{APIPort: 8080},
+		Data:   config.DataConfig{DataDir: tmpDir},
+	}
+	sched := newMockScheduler()
+	srv := NewServer(cfg, nil, sched, testLogger())
+
+	tokenJSON := `{
+		"access_token": "ya29.test",
+		"token_type": "Bearer",
+		"refresh_token": "1//test-refresh-token",
+		"client_id": "myapp.apps.googleusercontent.com"
+	}`
+
+	req := httptest.NewRequest("POST", "/api/v1/auth/token/test@gmail.com", strings.NewReader(tokenJSON))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	// Read back the saved token and verify client_id was preserved
+	tokenPath := filepath.Join(tmpDir, "tokens", "test@gmail.com.json")
+	data, err := os.ReadFile(tokenPath)
+	if err != nil {
+		t.Fatalf("read token file: %v", err)
+	}
+
+	var saved struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("unmarshal saved token: %v", err)
+	}
+	if saved.ClientID != "myapp.apps.googleusercontent.com" {
+		t.Errorf("client_id = %q, want myapp.apps.googleusercontent.com", saved.ClientID)
+	}
+}
+
 func TestHandleUploadTokenInvalidJSON(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "msgvault-test-tokens-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	cfg := &config.Config{
 		Server: config.ServerConfig{APIPort: 8080},
@@ -450,7 +603,7 @@ func TestHandleUploadTokenMissingRefreshToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	cfg := &config.Config{
 		Server: config.ServerConfig{APIPort: 8080},
@@ -541,7 +694,7 @@ func TestHandleAddAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	cfg := &config.Config{
 		Server:  config.ServerConfig{APIPort: 8080},
@@ -732,5 +885,479 @@ func TestSanitizeTokenPath(t *testing.T) {
 				t.Errorf("filename %q contains path separators", base)
 			}
 		})
+	}
+}
+
+// newTestServerWithEngine creates a test server with both mock store and mock engine.
+func newTestServerWithEngine(t *testing.T, engine *querytest.MockEngine) *Server {
+	t.Helper()
+
+	store := &mockStore{
+		stats: &StoreStats{
+			MessageCount:    10,
+			ThreadCount:     5,
+			SourceCount:     1,
+			LabelCount:      3,
+			AttachmentCount: 2,
+			DatabaseSize:    1024,
+		},
+		messages: []APIMessage{
+			{
+				ID:             1,
+				Subject:        "Test Subject",
+				From:           "sender@example.com",
+				To:             []string{"recipient@example.com"},
+				SentAt:         time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+				Snippet:        "This is a test message snippet",
+				Labels:         []string{"INBOX"},
+				HasAttachments: false,
+				SizeEstimate:   1024,
+				Body:           "This is the full message body text.",
+			},
+		},
+		total: 1,
+	}
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{APIPort: 8080},
+	}
+	sched := newMockScheduler()
+
+	srv := NewServerWithOptions(ServerOptions{
+		Config:    cfg,
+		Store:     store,
+		Engine:    engine,
+		Scheduler: sched,
+		Logger:    testLogger(),
+	})
+	return srv
+}
+
+func TestHandleAggregates(t *testing.T) {
+	engine := &querytest.MockEngine{
+		AggregateRows: []query.AggregateRow{
+			{Key: "alice@example.com", Count: 100, TotalSize: 50000, AttachmentSize: 10000, AttachmentCount: 5},
+			{Key: "bob@example.com", Count: 50, TotalSize: 25000, AttachmentSize: 5000, AttachmentCount: 2},
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/aggregates?view_type=senders", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp AggregateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.ViewType != "senders" {
+		t.Errorf("view_type = %q, want 'senders'", resp.ViewType)
+	}
+	if len(resp.Rows) != 2 {
+		t.Errorf("rows count = %d, want 2", len(resp.Rows))
+	}
+	if resp.Rows[0].Key != "alice@example.com" {
+		t.Errorf("first row key = %q, want 'alice@example.com'", resp.Rows[0].Key)
+	}
+}
+
+func TestHandleAggregatesNoEngine(t *testing.T) {
+	// Server without engine
+	cfg := &config.Config{
+		Server: config.ServerConfig{APIPort: 8080},
+	}
+	sched := newMockScheduler()
+	srv := NewServerWithOptions(ServerOptions{
+		Config:    cfg,
+		Store:     nil,
+		Engine:    nil,
+		Scheduler: sched,
+		Logger:    testLogger(),
+	})
+
+	req := httptest.NewRequest("GET", "/api/v1/aggregates?view_type=senders", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestHandleAggregatesInvalidViewType(t *testing.T) {
+	engine := &querytest.MockEngine{}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/aggregates?view_type=invalid", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleSubAggregates(t *testing.T) {
+	engine := &querytest.MockEngine{
+		AggregateRows: []query.AggregateRow{
+			{Key: "INBOX", Count: 80, TotalSize: 40000},
+			{Key: "SENT", Count: 20, TotalSize: 10000},
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/aggregates/sub?view_type=labels&sender=alice@example.com", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp AggregateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.ViewType != "labels" {
+		t.Errorf("view_type = %q, want 'labels'", resp.ViewType)
+	}
+	if len(resp.Rows) != 2 {
+		t.Errorf("rows count = %d, want 2", len(resp.Rows))
+	}
+}
+
+func TestHandleFilteredMessages(t *testing.T) {
+	engine := &querytest.MockEngine{
+		ListResults: []query.MessageSummary{
+			{
+				ID:             1,
+				Subject:        "Test Email",
+				FromEmail:      "alice@example.com",
+				SentAt:         time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+				Labels:         []string{"INBOX"},
+				HasAttachments: false,
+				SizeEstimate:   1024,
+			},
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/filter?sender=alice@example.com&limit=100", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	messages, ok := resp["messages"].([]interface{})
+	if !ok {
+		t.Fatal("expected messages array in response")
+	}
+	if len(messages) != 1 {
+		t.Errorf("messages count = %d, want 1", len(messages))
+	}
+}
+
+func TestHandleFilteredMessagesIncludesDeletedAt(t *testing.T) {
+	deletedAt := time.Date(2026, 3, 18, 15, 0, 0, 0, time.UTC)
+	engine := &querytest.MockEngine{
+		ListResults: []query.MessageSummary{
+			{
+				ID:        1,
+				Subject:   "Deleted Email",
+				FromEmail: "alice@example.com",
+				SentAt:    time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+				DeletedAt: &deletedAt,
+			},
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/filter?limit=100", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	messages, ok := resp["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("messages = %#v, want single message", resp["messages"])
+	}
+
+	message, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message = %#v, want object", messages[0])
+	}
+
+	if got := message["deleted_at"]; got != deletedAt.Format(time.RFC3339) {
+		t.Fatalf("deleted_at = %#v, want %q", got, deletedAt.Format(time.RFC3339))
+	}
+}
+
+func TestHandleTotalStats(t *testing.T) {
+	engine := &querytest.MockEngine{
+		Stats: &query.TotalStats{
+			MessageCount:    1000,
+			TotalSize:       5000000,
+			AttachmentCount: 100,
+			AttachmentSize:  1000000,
+			LabelCount:      10,
+			AccountCount:    2,
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/stats/total", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp TotalStatsResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.MessageCount != 1000 {
+		t.Errorf("message_count = %d, want 1000", resp.MessageCount)
+	}
+	if resp.TotalSize != 5000000 {
+		t.Errorf("total_size = %d, want 5000000", resp.TotalSize)
+	}
+}
+
+func TestHandleFastSearch(t *testing.T) {
+	engine := &querytest.MockEngine{
+		SearchFastResults: []query.MessageSummary{
+			{
+				ID:        1,
+				Subject:   "Invoice 12345",
+				FromEmail: "billing@example.com",
+				SentAt:    time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+			},
+		},
+		Stats: &query.TotalStats{
+			MessageCount: 1,
+			TotalSize:    1024,
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/search/fast?q=invoice", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp SearchFastResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Query != "invoice" {
+		t.Errorf("query = %q, want 'invoice'", resp.Query)
+	}
+	if len(resp.Messages) != 1 {
+		t.Errorf("messages count = %d, want 1", len(resp.Messages))
+	}
+}
+
+func TestHandleFastSearchMissingQuery(t *testing.T) {
+	engine := &querytest.MockEngine{}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/search/fast", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleFastSearchInvalidViewType(t *testing.T) {
+	engine := &querytest.MockEngine{}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/search/fast?q=test&view_type=invalid", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+
+	var errResp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+
+	if errResp["error"] != "invalid_view_type" {
+		t.Errorf("error = %q, want 'invalid_view_type'", errResp["error"])
+	}
+}
+
+func TestHandleDeepSearch(t *testing.T) {
+	engine := &querytest.MockEngine{
+		SearchResults: []query.MessageSummary{
+			{
+				ID:        1,
+				Subject:   "Meeting Notes",
+				FromEmail: "team@example.com",
+				SentAt:    time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+			},
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/search/deep?q=agenda", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp["query"] != "agenda" {
+		t.Errorf("query = %v, want 'agenda'", resp["query"])
+	}
+}
+
+func TestHandleDeepSearchMissingQuery(t *testing.T) {
+	engine := &querytest.MockEngine{}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/search/deep", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// mockSQLQueryEngine wraps MockEngine and adds SQLQuerier support.
+type mockSQLQueryEngine struct {
+	querytest.MockEngine
+	queryResult *query.QueryResult
+	queryErr    error
+}
+
+func (m *mockSQLQueryEngine) QuerySQL(_ context.Context, _ string) (*query.QueryResult, error) {
+	return m.queryResult, m.queryErr
+}
+
+func TestHandleQuery(t *testing.T) {
+	engine := &mockSQLQueryEngine{
+		queryResult: &query.QueryResult{
+			Columns:  []string{"from_email"},
+			Rows:     [][]any{{"alice@example.com"}},
+			RowCount: 1,
+		},
+	}
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{APIPort: 8080},
+	}
+	srv := NewServerWithOptions(ServerOptions{
+		Config: cfg,
+		Engine: engine,
+		Logger: testLogger(),
+	})
+
+	body := `{"sql": "SELECT from_email FROM v_senders LIMIT 1"}`
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var result query.QueryResult
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if result.RowCount != 1 {
+		t.Errorf("row_count = %d, want 1", result.RowCount)
+	}
+	if len(result.Columns) != 1 || result.Columns[0] != "from_email" {
+		t.Errorf("columns = %v, want [from_email]", result.Columns)
+	}
+}
+
+func TestHandleQuery_SQLiteEngine503(t *testing.T) {
+	engine := query.NewSQLiteEngine(nil)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{APIPort: 8080},
+	}
+	srv := NewServerWithOptions(ServerOptions{
+		Config: cfg,
+		Engine: engine,
+		Logger: testLogger(),
+	})
+
+	body := `{"sql": "SELECT 1"}`
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d, body: %s",
+			w.Code, http.StatusServiceUnavailable, w.Body.String())
+	}
+
+	var errResp ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp.Error != "engine_unavailable" {
+		t.Errorf("error = %q, want 'engine_unavailable'", errResp.Error)
 	}
 }

@@ -4,6 +4,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -50,6 +51,14 @@ type Options struct {
 	// ThreadMessageLimit overrides the maximum number of messages in a thread view.
 	// Zero uses the default (1,000).
 	ThreadMessageLimit int
+
+	// IsRemote indicates the TUI is connected to a remote server.
+	// Some features (deletion staging, attachment export) are disabled in remote mode.
+	IsRemote bool
+
+	// TextEngine provides text message query operations.
+	// When non-nil, the 'm' key toggles between Email and Texts mode.
+	TextEngine query.TextEngine
 }
 
 // modalType represents the type of modal dialog.
@@ -93,8 +102,17 @@ type selectionState struct {
 type Model struct {
 	viewState // Embedded state
 
+	// Top-level mode: Email or Texts
+	mode tuiMode
+
 	// Query engine for data access
 	engine query.Engine
+
+	// Text message query engine (nil if no text data available)
+	textEngine query.TextEngine
+
+	// Texts mode state (separate from email viewState)
+	textState textState
 
 	// Version info for title bar
 	version string
@@ -106,6 +124,9 @@ type Model struct {
 	// Configurable limits
 	aggregateLimit     int
 	threadMessageLimit int
+
+	// Remote mode (disables deletion/export)
+	isRemote bool
 
 	// Navigation
 	breadcrumbs []navigationSnapshot
@@ -210,12 +231,22 @@ func New(engine query.Engine, opts Options) Model {
 		threadLimit = defaultThreadMessageLimit
 	}
 
+	textEngine := opts.TextEngine
+	if textEngine == nil {
+		// Try type assertion as fallback
+		if te, ok := engine.(query.TextEngine); ok {
+			textEngine = te
+		}
+	}
+
 	return Model{
 		engine:             engine,
+		textEngine:         textEngine,
 		actions:            NewActionController(engine, opts.DataDir, nil),
 		version:            opts.Version,
 		aggregateLimit:     aggLimit,
 		threadMessageLimit: threadLimit,
+		isRemote:           opts.IsRemote,
 		viewState: viewState{
 			level:            levelAggregates,
 			viewType:         query.ViewSenders,
@@ -281,6 +312,17 @@ type accountsLoadedMsg struct {
 	err      error
 }
 
+// scopeLabelForLog returns a short, stable string describing the
+// current account scope so it can be attached to log records.
+// Uses "filtered" rather than the account identifier to avoid
+// persisting email addresses in the log file.
+func (m Model) scopeLabelForLog() string {
+	if m.accountFilter != nil {
+		return "filtered"
+	}
+	return "all"
+}
+
 // updateCheckMsg is sent when the background update check completes.
 type updateCheckMsg struct {
 	version    string // Latest version if available
@@ -290,6 +332,9 @@ type updateCheckMsg struct {
 // loadData fetches aggregate data based on current view settings.
 func (m Model) loadData() tea.Cmd {
 	requestID := m.aggregateRequestID
+	scopeLabel := m.scopeLabelForLog()
+	viewLabel := m.viewType.String()
+	searchTerm := m.searchQuery
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			opts := query.AggregateOptions{
@@ -303,6 +348,7 @@ func (m Model) loadData() tea.Cmd {
 				SearchQuery:           m.searchQuery,
 			}
 
+			start := time.Now()
 			ctx := context.Background()
 			var rows []query.AggregateRow
 			var err error
@@ -312,6 +358,23 @@ func (m Model) loadData() tea.Cmd {
 				rows, err = m.engine.SubAggregate(ctx, m.drillFilter, m.viewType, opts)
 			} else {
 				rows, err = m.engine.Aggregate(ctx, m.viewType, opts)
+			}
+			if err != nil {
+				slog.Warn("tui loadData failed",
+					"view", viewLabel,
+					"scope", scopeLabel,
+					"has_search", searchTerm != "",
+					"error", err.Error(),
+					"duration_ms", time.Since(start).Milliseconds(),
+				)
+			} else {
+				slog.Info("tui loadData ok",
+					"view", viewLabel,
+					"scope", scopeLabel,
+					"has_search", searchTerm != "",
+					"rows", len(rows),
+					"duration_ms", time.Since(start).Milliseconds(),
+				)
 			}
 
 			// When search is active, compute distinct message stats separately.
@@ -359,8 +422,16 @@ func (m Model) loadStats() tea.Cmd {
 func (m Model) loadAccounts() tea.Cmd {
 	return safeCmdWithPanic(
 		func() tea.Msg {
-			accounts, err := m.engine.ListAccounts(context.Background())
-			return accountsLoadedMsg{accounts: accounts, err: err}
+			ctx := context.Background()
+			accounts, err := m.engine.ListAccounts(ctx)
+			if err != nil {
+				slog.Warn("tui loadAccounts: ListAccounts failed",
+					"error", err)
+				return accountsLoadedMsg{err: err}
+			}
+			slog.Info("tui loadAccounts ok",
+				"accounts", len(accounts))
+			return accountsLoadedMsg{accounts: accounts}
 		},
 		func(r any) tea.Msg {
 			return accountsLoadedMsg{err: fmt.Errorf("accounts panic: %v", r)}
@@ -453,15 +524,44 @@ func (m Model) loadSearch(queryStr string) tea.Cmd {
 // loadSearchWithOffset executes the search query with pagination.
 func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults bool) tea.Cmd {
 	requestID := m.searchRequestID
+	modeLabel := "fast"
+	if m.searchMode != searchModeFast {
+		modeLabel = "deep"
+	}
+	scopeLabel := m.scopeLabelForLog()
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			ctx := context.Background()
 			q := search.Parse(queryStr)
 
+			start := time.Now()
 			var results []query.MessageSummary
 			var totalCount int64
 			var stats *query.TotalStats
 			var err error
+
+			defer func() {
+				if err != nil {
+					slog.Warn("tui search failed",
+						"query_len", len(queryStr),
+						"mode", modeLabel,
+						"scope", scopeLabel,
+						"offset", offset,
+						"error", err.Error(),
+						"duration_ms", time.Since(start).Milliseconds(),
+					)
+					return
+				}
+				slog.Info("tui search ok",
+					"query_len", len(queryStr),
+					"mode", modeLabel,
+					"scope", scopeLabel,
+					"offset", offset,
+					"results", len(results),
+					"total", totalCount,
+					"duration_ms", time.Since(start).Milliseconds(),
+				)
+			}()
 
 			if m.searchMode == searchModeFast {
 				// Fast search: single-scan with temp table materialization
@@ -575,13 +675,35 @@ func (m Model) loadMessages() tea.Cmd {
 // is true, the results are appended to the existing message list.
 func (m Model) loadMessagesWithOffset(offset int, appendMode bool) tea.Cmd {
 	requestID := m.loadRequestID
+	scopeLabel := m.scopeLabelForLog()
+	searchTerm := m.searchQuery
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			filter := m.buildMessageFilter()
 			filter.Pagination.Limit = messageListPageSize
 			filter.Pagination.Offset = offset
 
+			start := time.Now()
 			messages, err := m.engine.ListMessages(context.Background(), filter)
+			if err != nil {
+				slog.Warn("tui loadMessages failed",
+					"scope", scopeLabel,
+					"has_search", searchTerm != "",
+					"offset", offset,
+					"append", appendMode,
+					"error", err.Error(),
+					"duration_ms", time.Since(start).Milliseconds(),
+				)
+			} else {
+				slog.Info("tui loadMessages ok",
+					"scope", scopeLabel,
+					"has_search", searchTerm != "",
+					"offset", offset,
+					"append", appendMode,
+					"count", len(messages),
+					"duration_ms", time.Since(start).Milliseconds(),
+				)
+			}
 			return messagesLoadedMsg{messages: messages, err: err, requestID: requestID, append: appendMode}
 		},
 		func(r any) tea.Msg {
@@ -726,6 +848,96 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleSearchDebounce(msg)
 	case spinnerTickMsg:
 		return m.handleSpinnerTick()
+	// Text mode messages
+	case textConversationsLoadedMsg:
+		return m.handleTextConversationsLoaded(msg)
+	case textAggregateLoadedMsg:
+		return m.handleTextAggregateLoaded(msg)
+	case textMessagesLoadedMsg:
+		return m.handleTextMessagesLoaded(msg)
+	case textSearchResultMsg:
+		return m.handleTextSearchResult(msg)
+	case textStatsLoadedMsg:
+		return m.handleTextStatsLoaded(msg)
+	}
+	return m, nil
+}
+
+// handleTextConversationsLoaded processes text conversations load completion.
+func (m Model) handleTextConversationsLoaded(msg textConversationsLoadedMsg) (tea.Model, tea.Cmd) {
+	m.transitionBuffer = ""
+	m.loading = false
+	if msg.err != nil {
+		m.err = msg.err
+		m.modal = modalError
+		m.modalResult = msg.err.Error()
+		return m, nil
+	}
+	m.textState.conversations = msg.conversations
+	m.textState.stats = msg.stats
+	// Clamp cursor/scrollOffset to new data bounds to prevent
+	// out-of-range panics after account change or filter.
+	m.textState.clampCursorToConversations()
+	return m, nil
+}
+
+// handleTextAggregateLoaded processes text aggregate load completion.
+func (m Model) handleTextAggregateLoaded(msg textAggregateLoadedMsg) (tea.Model, tea.Cmd) {
+	m.transitionBuffer = ""
+	m.loading = false
+	if msg.err != nil {
+		m.err = msg.err
+		m.modal = modalError
+		m.modalResult = msg.err.Error()
+		return m, nil
+	}
+	m.textState.aggregateRows = msg.rows
+	m.textState.stats = msg.stats
+	// Clamp cursor/scrollOffset to new data bounds to prevent
+	// out-of-range panics after account change or filter.
+	m.textState.clampCursorToAggregates()
+	return m, nil
+}
+
+// handleTextMessagesLoaded processes text messages load completion.
+func (m Model) handleTextMessagesLoaded(msg textMessagesLoadedMsg) (tea.Model, tea.Cmd) {
+	m.transitionBuffer = ""
+	m.loading = false
+	if msg.err != nil {
+		m.err = msg.err
+		m.modal = modalError
+		m.modalResult = msg.err.Error()
+		return m, nil
+	}
+	m.textState.messages = msg.messages
+	m.textState.unfilteredMessages = nil // clear stale search snapshot
+	m.textState.cursor = 0
+	m.textState.scrollOffset = 0
+	return m, nil
+}
+
+// handleTextSearchResult processes text search results.
+func (m Model) handleTextSearchResult(msg textSearchResultMsg) (tea.Model, tea.Cmd) {
+	m.transitionBuffer = ""
+	m.loading = false
+	if msg.err != nil {
+		m.err = msg.err
+		m.modal = modalError
+		m.modalResult = msg.err.Error()
+		return m, nil
+	}
+	// Show search results as a timeline
+	m.textState.messages = msg.messages
+	m.textState.level = textLevelTimeline
+	m.textState.cursor = 0
+	m.textState.scrollOffset = 0
+	return m, nil
+}
+
+// handleTextStatsLoaded processes text stats load completion.
+func (m Model) handleTextStatsLoaded(msg textStatsLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.err == nil {
+		m.textState.stats = msg.stats
 	}
 	return m, nil
 }
@@ -784,9 +996,6 @@ func (m Model) handleDataLoaded(msg dataLoadedMsg) (tea.Model, tea.Cmd) {
 	}
 
 	m.err = nil
-	if m.modal == modalError {
-		m.modal = modalNone
-	}
 	if m.modal == modalError {
 		m.modal = modalNone
 	}
@@ -1070,11 +1279,12 @@ func (m Model) handleSearchDebounce(msg searchDebounceMsg) (tea.Model, tea.Cmd) 
 		m.searchFilter.WithAttachmentsOnly = m.filters.attachmentsOnly
 		m.searchFilter.HideDeletedFromSource = m.filters.hideDeletedFromSource
 		m.searchRequestID++
+		m.loadRequestID++ // Invalidate any in-flight loadMessages to prevent overwriting search results
 		if msg.query == "" {
 			// Empty query: reload unfiltered messages
-			m.loadRequestID++
 			return m, tea.Batch(spinCmd, m.loadMessages())
 		}
+		m.messages = nil // Clear stale messages immediately so they don't show during search
 		return m, tea.Batch(spinCmd, m.loadSearch(msg.query))
 	}
 	// Aggregate views: reload aggregates with search filter
@@ -1095,6 +1305,11 @@ func (m Model) handleSpinnerTick() (tea.Model, tea.Cmd) {
 
 // handleKeyPress processes keyboard input.
 func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Route to Texts mode handler when active
+	if m.mode == modeTexts {
+		return m.handleTextKeyPress(msg)
+	}
+
 	// Handle modal first (error modals must dismiss even during search)
 	if m.modal != modalNone {
 		return m.handleModalKeys(msg)
@@ -1304,6 +1519,10 @@ func (m Model) View() string {
 // Separated from View() so transitions can capture the current output
 // before changing state (for the transitionBuffer pattern).
 func (m Model) renderView() string {
+	if m.mode == modeTexts {
+		return m.renderTextView()
+	}
+
 	switch m.level {
 	case levelAggregates, levelDrillDown:
 		return fmt.Sprintf("%s\n%s\n%s",

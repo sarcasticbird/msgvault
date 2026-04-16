@@ -209,6 +209,66 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
+			name: "DomainNormalization",
+			tests: []testCase{
+				{
+					name:  "from bare domain gets @ prefix",
+					query: "from:example.com",
+					want:  Query{FromAddrs: []string{"@example.com"}},
+				},
+				{
+					name:  "from with @ prefix unchanged",
+					query: "from:@example.com",
+					want:  Query{FromAddrs: []string{"@example.com"}},
+				},
+				{
+					name:  "from full email unchanged",
+					query: "from:alice@example.com",
+					want:  Query{FromAddrs: []string{"alice@example.com"}},
+				},
+				{
+					name:  "to bare domain gets @ prefix",
+					query: "to:example.com",
+					want:  Query{ToAddrs: []string{"@example.com"}},
+				},
+				{
+					name:  "from bare word without dot unchanged",
+					query: "from:alice",
+					want:  Query{FromAddrs: []string{"alice"}},
+				},
+				{
+					name:  "from subdomain gets @ prefix",
+					query: "from:mail.example.co.uk",
+					want:  Query{FromAddrs: []string{"@mail.example.co.uk"}},
+				},
+				{
+					name:  "from dotted local part unchanged",
+					query: "from:john.doe",
+					want:  Query{FromAddrs: []string{"john.doe"}},
+				},
+				{
+					name:  "dotted local part with three segments unchanged",
+					query: "to:first.middle.last",
+					want:  Query{ToAddrs: []string{"first.middle.last"}},
+				},
+				{
+					name:  "from two-letter ccTLD detected as domain",
+					query: "from:company.io",
+					want:  Query{FromAddrs: []string{"@company.io"}},
+				},
+				{
+					name:  "new gTLD email detected as domain",
+					query: "from:contact.email",
+					want:  Query{FromAddrs: []string{"@contact.email"}},
+				},
+				{
+					name:  "new gTLD news detected as domain",
+					query: "from:brand.news",
+					want:  Query{FromAddrs: []string{"@brand.news"}},
+				},
+			},
+		},
+		{
 			name: "ComplexQuery",
 			tests: []testCase{
 				{

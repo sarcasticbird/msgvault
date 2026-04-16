@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/wesm/msgvault/internal/mbox"
@@ -23,8 +24,8 @@ type MboxImportOptions struct {
 	// Identifier is the sources.identifier (e.g. "you@hey.com").
 	Identifier string
 
-	// Label, if non-empty, is applied to all imported messages.
-	Label string
+	// Labels, if non-empty, are applied to all imported messages.
+	Labels []string
 
 	// NoResume forces a fresh import even if an active sync run exists for the source.
 	NoResume bool
@@ -60,6 +61,7 @@ type MboxImportSummary struct {
 	MessagesAdded     int64
 	MessagesUpdated   int64
 	MessagesSkipped   int64
+	LabelsUpdated     int64
 	Errors            int64
 	HardErrors        bool
 }
@@ -170,6 +172,12 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 		}
 	}
 
+	failSync := func(msg string) {
+		if fsErr := st.FailSync(syncID, msg); fsErr != nil {
+			log.Warn("failed to record sync failure", "error", fsErr)
+		}
+	}
+
 	// Save an initial checkpoint so the active sync always records which file it's importing,
 	// even if the run is interrupted before the first periodic checkpoint.
 	if err := saveMboxCheckpoint(st, syncID, cpFile, offset, seq, &cp); err != nil {
@@ -178,33 +186,39 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 		log.Warn("failed to save initial checkpoint", "error", err)
 	}
 
-	// Ensure label (once).
+	// Ensure labels (once). Deduplicate to avoid PK violations.
 	var labelIDs []int64
-	if opts.Label != "" {
-		labelID, err := st.EnsureLabel(src.ID, opts.Label, opts.Label, "user")
-		if err != nil {
-			_ = st.FailSync(syncID, err.Error())
-			return nil, fmt.Errorf("ensure label: %w", err)
+	seen := make(map[string]bool)
+	for _, lbl := range opts.Labels {
+		lbl = strings.TrimSpace(lbl)
+		if lbl == "" || seen[lbl] {
+			continue
 		}
-		labelIDs = []int64{labelID}
+		seen[lbl] = true
+		labelID, err := st.EnsureLabel(src.ID, lbl, lbl, "user")
+		if err != nil {
+			failSync(err.Error())
+			return nil, fmt.Errorf("ensure label %q: %w", lbl, err)
+		}
+		labelIDs = append(labelIDs, labelID)
 	}
 
 	// Open file and (if resuming) seek.
 	f, err := os.Open(absPath)
 	if err != nil {
-		_ = st.FailSync(syncID, err.Error())
+		failSync(err.Error())
 		return nil, fmt.Errorf("open mbox: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
-		_ = st.FailSync(syncID, err.Error())
+		failSync(err.Error())
 		return nil, fmt.Errorf("stat mbox: %w", err)
 	}
 	if offset > fi.Size() {
 		resumeErr := fmt.Errorf("resume offset %d is beyond end of file (size %d) for %q; rerun with --no-resume to start fresh", offset, fi.Size(), absPath)
-		_ = st.FailSync(syncID, resumeErr.Error())
+		failSync(resumeErr.Error())
 		return nil, resumeErr
 	}
 	if offset > 0 && offset == fi.Size() {
@@ -213,18 +227,18 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			_ = st.FailSync(syncID, err.Error())
+			failSync(err.Error())
 			return nil, fmt.Errorf("seek mbox: %w", err)
 		}
 	}
 
 	if offset == 0 && cp.MessagesProcessed == 0 {
 		if err := mbox.Validate(f, 8<<20); err != nil {
-			_ = st.FailSync(syncID, err.Error())
+			failSync(err.Error())
 			return summary, err
 		}
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			_ = st.FailSync(syncID, err.Error())
+			failSync(err.Error())
 			return nil, fmt.Errorf("seek mbox: %w", err)
 		}
 	}
@@ -234,8 +248,8 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 	// If we resumed at a saved offset, the reader's logical Offset() should now be that.
 	// However, if the offset lands in the middle of a line (corrupt checkpoint), the
 	// reader will scan to the next separator.
-	var lastCheckpointOffset int64 = offset
-	var lastCheckpointSeq int64 = seq
+	var lastCheckpointOffset = offset
+	var lastCheckpointSeq = seq
 	checkpointBlocked := false
 	hardErrors := false
 
@@ -310,11 +324,30 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 					log.Warn("existence check failed; attempting ingest anyway", "error", err)
 				} else {
 					_, exists = one[p.SourceMsg]
+					// Merge into existingWithRaw so label update can find the message ID.
+					if existingWithRaw == nil {
+						existingWithRaw = make(map[string]int64)
+					}
+					for k, v := range one {
+						existingWithRaw[k] = v
+					}
 				}
 			}
 
 			if exists {
 				summary.MessagesSkipped++
+
+				// Add labels to existing message (same pattern as emlx importer).
+				if len(labelIDs) > 0 {
+					if msgID, ok := existingWithRaw[p.SourceMsg]; ok && msgID > 0 {
+						if err := st.AddMessageLabels(msgID, labelIDs); err != nil {
+							log.Warn("failed to add labels to existing message",
+								"source_message_id", p.SourceMsg, "error", err)
+						} else {
+							summary.LabelsUpdated++
+						}
+					}
+				}
 
 				// Update checkpoint offset even when skipping so resumption progresses.
 				if !checkpointBlocked {

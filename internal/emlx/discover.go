@@ -21,27 +21,10 @@ type Mailbox struct {
 	// Label is the derived label for messages in this mailbox.
 	Label string
 
-	// Files contains sorted .emlx filenames within MsgDir plus any
-	// files discovered in numeric partition subdirectories.
+	// Files contains sorted absolute paths to .emlx files within
+	// this mailbox, including files from numeric partition
+	// subdirectories in V10 layouts.
 	Files []string
-
-	// FileIndex maps filename → absolute path of the Messages/ subdirectory
-	// within a numeric partition directory, for V10 partitioned layouts.
-	// Files in MsgDir itself are absent from this map. Nil when no
-	// partition files exist.
-	FileIndex map[string]string
-}
-
-// FilePath returns the absolute path to a .emlx file within this mailbox.
-// For files in numeric partition directories, the path is resolved via
-// FileIndex; all other files are resolved relative to MsgDir.
-func (m *Mailbox) FilePath(fileName string) string {
-	if m.FileIndex != nil {
-		if sub, ok := m.FileIndex[fileName]; ok {
-			return filepath.Join(sub, fileName)
-		}
-	}
-	return filepath.Join(m.MsgDir, fileName)
 }
 
 // DiscoverMailboxes walks an Apple Mail directory tree and returns all
@@ -68,7 +51,7 @@ func DiscoverMailboxes(rootDir string) ([]Mailbox, error) {
 
 	// Auto-detect: if the path itself is a mailbox, import just that one.
 	if isMailboxDir(abs) {
-		msgDir, files, fileIndex, err := listEmlxFiles(abs)
+		msgDir, files, err := listEmlxFiles(abs)
 		if err != nil {
 			return nil, err
 		}
@@ -77,7 +60,6 @@ func DiscoverMailboxes(rootDir string) ([]Mailbox, error) {
 			return []Mailbox{{
 				Path: abs, MsgDir: msgDir,
 				Label: label, Files: files,
-				FileIndex: fileIndex,
 			}}, nil
 		}
 	}
@@ -101,7 +83,7 @@ func DiscoverMailboxes(rootDir string) ([]Mailbox, error) {
 			return nil
 		}
 
-		msgDir, files, fileIndex, listErr := listEmlxFiles(path)
+		msgDir, files, listErr := listEmlxFiles(path)
 		if listErr != nil || len(files) == 0 {
 			return nil
 		}
@@ -110,7 +92,6 @@ func DiscoverMailboxes(rootDir string) ([]Mailbox, error) {
 		mailboxes = append(mailboxes, Mailbox{
 			Path: path, MsgDir: msgDir,
 			Label: label, Files: files,
-			FileIndex: fileIndex,
 		})
 
 		return nil
@@ -325,23 +306,22 @@ func stripMailboxSuffix(name string) string {
 	return name
 }
 
-// listEmlxFiles returns the Messages directory path, sorted .emlx
-// filenames (from both the primary Messages/ dir and numeric partition
-// subdirectories), and a FileIndex mapping partition filenames to their
-// containing subdirectory. Returns ("", nil, nil, nil) if no Messages
-// directory is found.
+// listEmlxFiles returns the Messages directory path and sorted
+// absolute paths to .emlx files (from both the primary Messages/ dir
+// and numeric partition subdirectories).
+// Returns ("", nil, nil) if no Messages directory is found.
 func listEmlxFiles(
 	mailboxPath string,
-) (string, []string, map[string]string, error) {
+) (string, []string, error) {
 	msgDir := findMessagesDir(mailboxPath)
 	if msgDir == "" {
-		return "", nil, nil, nil
+		return "", nil, nil
 	}
 
 	entries, err := os.ReadDir(msgDir)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return "", nil, nil, fmt.Errorf("read Messages dir: %w", err)
+			return "", nil, fmt.Errorf("read Messages dir: %w", err)
 		}
 		// Primary Messages/ dir absent (partition-only layout); continue
 		// so that partition files are still collected below.
@@ -351,43 +331,35 @@ func listEmlxFiles(
 	var files []string
 	for _, e := range entries {
 		if !e.IsDir() && isEmlxFile(e.Name()) {
-			files = append(files, e.Name())
+			files = append(files, filepath.Join(msgDir, e.Name()))
 		}
 	}
 
 	// Walk numeric partition dirs in Data/ (parent of Messages/).
 	// Only enter digit dirs (0-9) to avoid re-collecting from the
 	// primary Messages/ dir which was already handled above.
-	var fileIndex map[string]string
 	dataDir := filepath.Dir(msgDir)
 	if filepath.Base(dataDir) == "Data" {
-		result := make(map[string]string)
 		topEntries, readErr := os.ReadDir(dataDir)
 		if readErr == nil {
 			for _, e := range topEntries {
 				if e.IsDir() && isDigitDir(e.Name()) {
 					collectPartitionFiles(
-						filepath.Join(dataDir, e.Name()), result,
+						filepath.Join(dataDir, e.Name()), &files,
 					)
 				}
-			}
-		}
-		if len(result) > 0 {
-			fileIndex = result
-			for name := range result {
-				files = append(files, name)
 			}
 		}
 	}
 
 	sort.Strings(files)
-	return msgDir, files, fileIndex, nil
+	return msgDir, files, nil
 }
 
-// collectPartitionFiles recursively walks dir for Messages/ subdirs and
-// numeric partition dirs (0-9), collecting .emlx files into result
-// (filename → absolute Messages/ dir path).
-func collectPartitionFiles(dir string, result map[string]string) {
+// collectPartitionFiles recursively walks dir for Messages/ subdirs
+// and numeric partition dirs (0-9), appending absolute .emlx file
+// paths to files.
+func collectPartitionFiles(dir string, files *[]string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -405,11 +377,11 @@ func collectPartitionFiles(dir string, result map[string]string) {
 			}
 			for _, m := range msgs {
 				if !m.IsDir() && isEmlxFile(m.Name()) {
-					result[m.Name()] = msgDir
+					*files = append(*files, filepath.Join(msgDir, m.Name()))
 				}
 			}
 		} else if isDigitDir(name) {
-			collectPartitionFiles(filepath.Join(dir, name), result)
+			collectPartitionFiles(filepath.Join(dir, name), files)
 		}
 	}
 }

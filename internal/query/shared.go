@@ -12,6 +12,14 @@ import (
 	"github.com/wesm/msgvault/internal/mime"
 )
 
+// emailOnlyFilterMsg is the SQL condition restricting to email messages with "msg." alias (DuckDB).
+// NULL and empty string handle old data where message_type was not yet populated.
+const emailOnlyFilterMsg = "(msg.message_type = 'email' OR msg.message_type IS NULL OR msg.message_type = '')"
+
+// emailOnlyFilterM is the SQL condition restricting to email messages with "m." alias (SQLite).
+// NULL and empty string handle old data where message_type was not yet populated.
+const emailOnlyFilterM = "(m.message_type = 'email' OR m.message_type IS NULL OR m.message_type = '')"
+
 // fetchLabelsForMessageList adds labels to message summaries using a batch query.
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 func fetchLabelsForMessageList(ctx context.Context, db *sql.DB, tablePrefix string, messages []MessageSummary) error {
@@ -39,7 +47,7 @@ func fetchLabelsForMessageList(ctx context.Context, db *sql.DB, tablePrefix stri
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var msgID int64
@@ -67,7 +75,7 @@ func fetchMessageLabelsDetail(ctx context.Context, db *sql.DB, tablePrefix strin
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var name string
@@ -92,7 +100,7 @@ func fetchParticipantsShared(ctx context.Context, db *sql.DB, tablePrefix string
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var recipType, email, name string
@@ -126,7 +134,7 @@ func fetchAttachmentsShared(ctx context.Context, db *sql.DB, tablePrefix string,
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var att AttachmentInfo
@@ -158,7 +166,7 @@ func extractBodyFromRawShared(ctx context.Context, db *sql.DB, tablePrefix strin
 		if err != nil {
 			return "", err
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		rawData, err = io.ReadAll(r)
 		if err != nil {
 			return "", err
@@ -270,7 +278,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, tablePrefix string
 
 // collectGmailIDs scans rows for source_message_id strings.
 func collectGmailIDs(rows *sql.Rows) ([]string, error) {
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var ids []string
 	for rows.Next() {
 		var id string

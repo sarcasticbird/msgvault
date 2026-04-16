@@ -4,17 +4,39 @@ package imap
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
+	"strings"
+)
+
+// AuthMethod specifies how the IMAP client authenticates.
+type AuthMethod string
+
+const (
+	// AuthPassword uses traditional LOGIN (username + password).
+	AuthPassword AuthMethod = "password"
+	// AuthXOAuth2 uses XOAUTH2 SASL mechanism (OAuth2 bearer token).
+	AuthXOAuth2 AuthMethod = "xoauth2"
 )
 
 // Config holds connection settings for an IMAP server.
 type Config struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	TLS      bool   `json:"tls"`      // Implicit TLS (IMAPS, port 993)
-	STARTTLS bool   `json:"starttls"` // STARTTLS upgrade (port 143)
-	Username string `json:"username"`
+	Host       string     `json:"host"`
+	Port       int        `json:"port"`
+	TLS        bool       `json:"tls"`      // Implicit TLS (IMAPS, port 993)
+	STARTTLS   bool       `json:"starttls"` // STARTTLS upgrade (port 143)
+	Username   string     `json:"username"`
+	AuthMethod AuthMethod `json:"auth_method,omitempty"`
+}
+
+// EffectiveAuthMethod returns the auth method, defaulting to password
+// when the field is empty (backward compatibility with existing configs).
+func (c *Config) EffectiveAuthMethod() AuthMethod {
+	if c.AuthMethod == "" {
+		return AuthPassword
+	}
+	return c.AuthMethod
 }
 
 // Addr returns the "host:port" string.
@@ -27,7 +49,7 @@ func (c *Config) Addr() string {
 			port = 143
 		}
 	}
-	return fmt.Sprintf("%s:%d", c.Host, port)
+	return net.JoinHostPort(normalizeHost(c.Host), strconv.Itoa(port))
 }
 
 // Identifier returns a canonical string like "imaps://user@host:port".
@@ -48,7 +70,18 @@ func (c *Config) Identifier() string {
 			port = 143
 		}
 	}
-	return fmt.Sprintf("%s://%s@%s:%d", scheme, url.PathEscape(c.Username), c.Host, port)
+	return fmt.Sprintf(
+		"%s://%s@%s",
+		scheme,
+		url.PathEscape(c.Username),
+		net.JoinHostPort(normalizeHost(c.Host), strconv.Itoa(port)),
+	)
+}
+
+// normalizeHost strips surrounding IPv6 brackets so callers can pass either
+// "::1" or "[::1]" and still get a valid host:port from net.JoinHostPort.
+func normalizeHost(host string) string {
+	return strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
 }
 
 // ToJSON serializes the config to JSON.

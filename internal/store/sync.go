@@ -78,7 +78,7 @@ func scanSource(sc scanner) (*Source, error) {
 	err := sc.Scan(
 		&source.ID, &source.SourceType, &source.Identifier, &source.DisplayName,
 		&source.GoogleUserID, &lastSyncAt, &source.SyncCursor, &source.SyncConfig,
-		&createdAt, &updatedAt,
+		&source.OAuthApp, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -263,6 +263,7 @@ type Source struct {
 	LastSyncAt   sql.NullTime
 	SyncCursor   sql.NullString // historyId for Gmail
 	SyncConfig   sql.NullString // JSON config for IMAP sources
+	OAuthApp     sql.NullString // named OAuth app binding (NULL = default)
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -272,7 +273,8 @@ func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error
 	// Try to get existing
 	row := s.db.QueryRow(`
 		SELECT id, source_type, identifier, display_name, google_user_id,
-		       last_sync_at, sync_cursor, sync_config, created_at, updated_at
+		       last_sync_at, sync_cursor, sync_config, oauth_app,
+		       created_at, updated_at
 		FROM sources
 		WHERE source_type = ? AND identifier = ?
 	`, sourceType, identifier)
@@ -324,7 +326,8 @@ func (s *Store) ListSources(sourceType string) ([]*Source, error) {
 	if sourceType != "" {
 		rows, err = s.db.Query(`
 			SELECT id, source_type, identifier, display_name, google_user_id,
-			       last_sync_at, sync_cursor, sync_config, created_at, updated_at
+			       last_sync_at, sync_cursor, sync_config, oauth_app,
+			       created_at, updated_at
 			FROM sources
 			WHERE source_type = ?
 			ORDER BY identifier
@@ -332,7 +335,8 @@ func (s *Store) ListSources(sourceType string) ([]*Source, error) {
 	} else {
 		rows, err = s.db.Query(`
 			SELECT id, source_type, identifier, display_name, google_user_id,
-			       last_sync_at, sync_cursor, sync_config, created_at, updated_at
+			       last_sync_at, sync_cursor, sync_config, oauth_app,
+			       created_at, updated_at
 			FROM sources
 			ORDER BY identifier
 		`)
@@ -340,7 +344,7 @@ func (s *Store) ListSources(sourceType string) ([]*Source, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list sources: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sources []*Source
 	for rows.Next() {
@@ -377,11 +381,24 @@ func (s *Store) UpdateSourceSyncConfig(sourceID int64, configJSON string) error 
 	return err
 }
 
+// UpdateSourceIdentifier updates the identifier column for an existing source.
+// Used by add-o365 to fix up the IMAP host when re-authorizing an account
+// whose host classification changed (e.g. personal vs org scope correction).
+func (s *Store) UpdateSourceIdentifier(sourceID int64, identifier string) error {
+	_, err := s.db.Exec(`
+		UPDATE sources
+		SET identifier = ?, updated_at = datetime('now')
+		WHERE id = ?
+	`, identifier, sourceID)
+	return err
+}
+
 // GetSourceByIdentifier returns a source by its identifier (email address).
 func (s *Store) GetSourceByIdentifier(identifier string) (*Source, error) {
 	row := s.db.QueryRow(`
 		SELECT id, source_type, identifier, display_name, google_user_id,
-		       last_sync_at, sync_cursor, sync_config, created_at, updated_at
+		       last_sync_at, sync_cursor, sync_config, oauth_app,
+		       created_at, updated_at
 		FROM sources
 		WHERE identifier = ?
 	`, identifier)

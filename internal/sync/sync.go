@@ -37,9 +37,6 @@ type Options struct {
 	// BatchSize is the number of messages to fetch in parallel (default: 10)
 	BatchSize int
 
-	// CheckpointInterval is how often to save progress (default: every 200 messages)
-	CheckpointInterval int
-
 	// AttachmentsDir is where to store attachments
 	AttachmentsDir string
 
@@ -53,8 +50,8 @@ type Options struct {
 // DefaultOptions returns sensible defaults.
 func DefaultOptions() *Options {
 	return &Options{
-		BatchSize:          10,
-		CheckpointInterval: 200,
+		BatchSize:  10,
+		SourceType: "gmail",
 	}
 }
 
@@ -190,6 +187,7 @@ func (s *Syncer) processBatch(ctx context.Context, sourceID int64, listResp *gma
 
 		for i, raw := range rawMessages {
 			if raw == nil {
+				s.logger.Warn("failed to fetch message (nil response)", "id", newIDs[i])
 				checkpoint.ErrorsCount++
 				continue
 			}
@@ -371,6 +369,13 @@ func (s *Syncer) Full(ctx context.Context, email string) (summary *gmail.SyncSum
 		s.logger.Warn("failed to complete sync", "error", err)
 	}
 
+	// Checkpoint WAL after sync to fold it back into the main database.
+	// This prevents WAL accumulation across long sync sessions and ensures
+	// readers (e.g. build-cache) see a consistent database state.
+	if err := s.store.CheckpointWAL(); err != nil {
+		s.logger.Warn("wal checkpoint after sync failed", "error", err)
+	}
+
 	// Build summary
 	summary.EndTime = time.Now()
 	summary.Duration = summary.EndTime.Sub(summary.StartTime)
@@ -394,9 +399,12 @@ func (s *Syncer) syncLabels(ctx context.Context, sourceID int64) (map[string]int
 
 	labelInfos := make(map[string]store.LabelInfo)
 	for _, l := range labels {
-		labelType := "user"
-		if store.IsSystemLabel(l.ID) {
-			labelType = "system"
+		labelType := l.Type
+		if labelType == "" {
+			labelType = "user"
+			if store.IsSystemLabel(l.ID) {
+				labelType = "system"
+			}
 		}
 		labelInfos[l.ID] = store.LabelInfo{Name: l.Name, Type: labelType}
 	}

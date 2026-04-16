@@ -1,6 +1,6 @@
 # Build stage
 # Pin by digest for reproducibility; update periodically
-FROM golang:1.25-bookworm@sha256:7af46e70d2017aef0b4ce2422afbcf39af0511a61993103e948b61011233ec42 AS builder
+FROM golang:1.25-bookworm@sha256:29e59af995c51a5bf63d072eca973b918e0e7af4db0e4667aa73f1b8da1a6d8c AS builder
 
 # Install build dependencies for CGO (SQLite, DuckDB)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -34,19 +34,18 @@ RUN CGO_ENABLED=1 go build \
     -o /msgvault \
     ./cmd/msgvault
 
-# Runtime stage
-FROM debian:bookworm-slim@sha256:98f4b71de414932439ac6ac690d7060df1f27161073c5036a7553723881bffbe
+# Runtime stage — wolfi-base provides current glibc for CGO/DuckDB bindings
+FROM cgr.dev/chainguard/wolfi-base@sha256:52e71f61c6afd1f8d2625cff4465d8ecee156668ca665f7e9c582d1cc914eb6a
 
-# Install runtime dependencies (libstdc++6 required for CGO/DuckDB)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install runtime dependencies (libstdc++ required for CGO/DuckDB)
+RUN apk update && apk add --no-cache \
     ca-certificates \
     tzdata \
     wget \
-    libstdc++6 \
-    && rm -rf /var/lib/apt/lists/*
+    libstdc++
 
 # Create non-root user
-RUN useradd -m -u 1000 -s /bin/sh msgvault
+RUN adduser -D -h /home/msgvault -u 1000 -s /bin/sh msgvault
 
 # Copy binary from builder
 COPY --from=builder /msgvault /usr/local/bin/msgvault

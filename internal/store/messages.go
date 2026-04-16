@@ -301,7 +301,7 @@ func (s *Store) GetMessageRaw(messageID int64) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("zlib reader: %w", err)
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		return io.ReadAll(r)
 	}
 
@@ -476,31 +476,134 @@ type Label struct {
 	LabelType     sql.NullString
 }
 
-// EnsureLabel gets or creates a label.
-func (s *Store) EnsureLabel(sourceID int64, sourceLabelID, name, labelType string) (int64, error) {
-	// Try to get existing
+// dbQuerier abstracts *sql.DB and *sql.Tx for functions that need to
+// run both standalone and inside a transaction.
+type dbQuerier interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+// EnsureLabel gets or creates a label, handling renames and ID changes.
+// For batch operations prefer EnsureLabelsBatch which runs in a single
+// transaction.
+func (s *Store) EnsureLabel(
+	sourceID int64,
+	sourceLabelID, name, labelType string,
+) (int64, error) {
 	var id int64
-	err := s.db.QueryRow(`
-		SELECT id FROM labels WHERE source_id = ? AND source_label_id = ?
-	`, sourceID, sourceLabelID).Scan(&id)
+	err := s.withTx(func(tx *sql.Tx) error {
+		var txErr error
+		id, txErr = ensureLabelWith(
+			tx, sourceID, sourceLabelID, name, labelType,
+		)
+		return txErr
+	})
+	return id, err
+}
+
+// ensureLabelWith is the core label-upsert logic, parameterised on the
+// database handle so it works both standalone and inside a transaction.
+//
+// Labels are identified by source_label_id (Gmail label ID) but have a
+// UNIQUE constraint on (source_id, name). This function handles:
+//   - Existing label found by source_label_id: updates name if renamed
+//   - Name conflict with different source_label_id: upserts, adopting
+//     the new source_label_id (handles deleted+recreated labels, imports)
+func ensureLabelWith(
+	q dbQuerier,
+	sourceID int64,
+	sourceLabelID, name, labelType string,
+) (int64, error) {
+	// Look up by canonical identifier (Gmail label ID).
+	var id int64
+	var existingName string
+	err := q.QueryRow(`
+		SELECT id, name FROM labels
+		WHERE source_id = ? AND source_label_id = ?
+	`, sourceID, sourceLabelID).Scan(&id, &existingName)
 
 	if err == nil {
+		if existingName == name {
+			return id, nil
+		}
+		// Label was renamed — update the name. If another row already
+		// claims the target name, merge it: move its message-label
+		// associations to the canonical row and delete the stale one.
+		if err = mergeLabelByName(q, sourceID, name, id); err != nil {
+			return 0, err
+		}
+		if _, err = q.Exec(`
+			UPDATE labels SET name = ?, label_type = ?
+			WHERE id = ?
+		`, name, labelType, id); err != nil {
+			return 0, fmt.Errorf("update label name: %w", err)
+		}
 		return id, nil
 	}
 	if err != sql.ErrNoRows {
 		return 0, err
 	}
 
-	// Create new
-	result, err := s.db.Exec(`
+	// Not found by source_label_id — upsert by name. Handles the case
+	// where a label with this name exists from a previous import or
+	// with a stale/NULL source_label_id.
+	if _, err = q.Exec(`
 		INSERT INTO labels (source_id, source_label_id, name, label_type)
 		VALUES (?, ?, ?, ?)
-	`, sourceID, sourceLabelID, name, labelType)
-	if err != nil {
+		ON CONFLICT(source_id, name) DO UPDATE SET
+			source_label_id = excluded.source_label_id,
+			label_type = excluded.label_type
+	`, sourceID, sourceLabelID, name, labelType); err != nil {
 		return 0, err
 	}
 
-	return result.LastInsertId()
+	err = q.QueryRow(`
+		SELECT id FROM labels WHERE source_id = ? AND name = ?
+	`, sourceID, name).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// mergeLabelByName finds a label with the given name (excluding keepID)
+// and merges it into keepID: message-label associations are reassigned
+// and the stale row is deleted. No-op if no conflicting label exists.
+func mergeLabelByName(
+	q dbQuerier, sourceID int64, name string, keepID int64,
+) error {
+	var conflictID int64
+	err := q.QueryRow(`
+		SELECT id FROM labels
+		WHERE source_id = ? AND name = ? AND id != ?
+	`, sourceID, name, keepID).Scan(&conflictID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("find conflicting label: %w", err)
+	}
+	// Reassign message-label associations. OR IGNORE skips rows
+	// where the message already has keepID (avoids PK violation).
+	if _, err = q.Exec(`
+		UPDATE OR IGNORE message_labels
+		SET label_id = ? WHERE label_id = ?
+	`, keepID, conflictID); err != nil {
+		return fmt.Errorf("reassign label associations: %w", err)
+	}
+	// Remove any remaining rows that couldn't be reassigned
+	// (duplicates skipped by OR IGNORE above).
+	if _, err = q.Exec(`
+		DELETE FROM message_labels WHERE label_id = ?
+	`, conflictID); err != nil {
+		return fmt.Errorf("clean up duplicate associations: %w", err)
+	}
+	if _, err = q.Exec(`
+		DELETE FROM labels WHERE id = ?
+	`, conflictID); err != nil {
+		return fmt.Errorf("delete conflicting label: %w", err)
+	}
+	return nil
 }
 
 // LabelInfo holds the name and type for a label to be ensured.
@@ -518,18 +621,61 @@ func IsSystemLabel(sourceLabelID string) bool {
 	return strings.HasPrefix(sourceLabelID, "CATEGORY_")
 }
 
-// EnsureLabelsBatch ensures all labels exist and returns a map of source_label_id -> internal ID.
-func (s *Store) EnsureLabelsBatch(sourceID int64, labels map[string]LabelInfo) (map[string]int64, error) {
-	result := make(map[string]int64)
-
-	for sourceLabelID, info := range labels {
-		id, err := s.EnsureLabel(sourceID, sourceLabelID, info.Name, info.Type)
-		if err != nil {
-			return nil, err
+// EnsureLabelsBatch ensures all labels exist and returns a map of
+// source_label_id -> internal ID. Runs in a single transaction with
+// a two-phase rename to handle cross-renames safely (e.g. L1:Foo→Bar
+// and L2:Bar→Foo in the same batch).
+func (s *Store) EnsureLabelsBatch(
+	sourceID int64, labels map[string]LabelInfo,
+) (map[string]int64, error) {
+	result := make(map[string]int64, len(labels))
+	err := s.withTx(func(tx *sql.Tx) error {
+		// Phase 1: Move all renamed labels to temporary names so
+		// that cross-renames don't cause one label to incorrectly
+		// merge the other. Temp names use the row PK (unique by
+		// construction) with a prefix that can't be a real label.
+		for sourceLabelID, info := range labels {
+			var id int64
+			var curName string
+			err := tx.QueryRow(`
+				SELECT id, name FROM labels
+				WHERE source_id = ? AND source_label_id = ?
+			`, sourceID, sourceLabelID).Scan(&id, &curName)
+			if err == sql.ErrNoRows || curName == info.Name {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf(
+					"check label %s: %w", sourceLabelID, err,
+				)
+			}
+			if _, err = tx.Exec(`
+				UPDATE labels SET name = CAST(id AS TEXT) || X'00'
+				WHERE id = ?
+			`, id); err != nil {
+				return fmt.Errorf(
+					"clear name for label %s: %w", sourceLabelID, err,
+				)
+			}
 		}
-		result[sourceLabelID] = id
-	}
 
+		// Phase 2: Apply final names. After phase 1 any remaining
+		// name conflict is from a label NOT in this batch, which
+		// is safe to merge (dead/imported label).
+		for sourceLabelID, info := range labels {
+			id, err := ensureLabelWith(
+				tx, sourceID, sourceLabelID, info.Name, info.Type,
+			)
+			if err != nil {
+				return err
+			}
+			result[sourceLabelID] = id
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -584,6 +730,12 @@ func (s *Store) AddMessageLabels(messageID int64, labelIDs []int64) error {
 				return values, args
 			})
 	})
+}
+
+// LinkMessageLabel links a single label to a message.
+// Uses INSERT OR IGNORE — safe to call multiple times.
+func (s *Store) LinkMessageLabel(messageID, labelID int64) error {
+	return s.AddMessageLabels(messageID, []int64{labelID})
 }
 
 // RemoveMessageLabels removes specific labels from a message.
@@ -770,7 +922,7 @@ func (s *Store) GetRandomMessageIDs(sourceID int64, limit int) ([]int64, error) 
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		var ids []int64
 		for rows.Next() {
@@ -889,7 +1041,13 @@ func (s *Store) backfillFTSBatch(fromID, toID int64) (int64, error) {
 	result, err := s.db.Exec(`
 		INSERT OR REPLACE INTO messages_fts (rowid, message_id, subject, body, from_addr, to_addr, cc_addr)
 		SELECT m.id, m.id, COALESCE(m.subject, ''), COALESCE(mb.body_text, ''),
-			COALESCE((SELECT GROUP_CONCAT(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'from'), ''),
+			COALESCE(
+				CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
+				     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
+				END,
+				(SELECT GROUP_CONCAT(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'from'),
+				''
+			),
 			COALESCE((SELECT GROUP_CONCAT(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), ''),
 			COALESCE((SELECT GROUP_CONCAT(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), '')
 		FROM messages m
@@ -900,6 +1058,208 @@ func (s *Store) backfillFTSBatch(fromID, toID int64) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// RecomputeConversationStats updates the denormalized stats columns on all conversations
+// belonging to the given source. It recomputes message_count, participant_count,
+// last_message_at, and last_message_preview from the current table state.
+// Safe to call multiple times — always produces the same result (idempotent).
+func (s *Store) RecomputeConversationStats(sourceID int64) error {
+	_, err := s.db.Exec(`
+		UPDATE conversations SET
+			message_count = (
+				SELECT COUNT(*) FROM messages
+				WHERE conversation_id = conversations.id
+			),
+			participant_count = (
+				SELECT COUNT(*) FROM conversation_participants
+				WHERE conversation_id = conversations.id
+			),
+			last_message_at = (
+				SELECT MAX(COALESCE(sent_at, received_at, internal_date))
+				FROM messages
+				WHERE conversation_id = conversations.id
+			),
+			last_message_preview = (
+				SELECT snippet FROM messages
+				WHERE conversation_id = conversations.id
+				ORDER BY COALESCE(sent_at, received_at, internal_date) DESC, id DESC
+				LIMIT 1
+			)
+		WHERE source_id = ?
+	`, sourceID)
+	if err != nil {
+		return fmt.Errorf("recompute conversation stats: %w", err)
+	}
+	return nil
+}
+
+// EnsureConversationWithType gets or creates a conversation with an explicit conversation_type.
+// Unlike EnsureConversation (which hardcodes 'email_thread'), this accepts the type as a parameter,
+// making it suitable for WhatsApp and other messaging platforms.
+func (s *Store) EnsureConversationWithType(sourceID int64, sourceConversationID, conversationType, title string) (int64, error) {
+	// Try to get existing
+	var id int64
+	err := s.db.QueryRow(`
+		SELECT id FROM conversations
+		WHERE source_id = ? AND source_conversation_id = ?
+	`, sourceID, sourceConversationID).Scan(&id)
+
+	if err == nil {
+		// Update conversation_type and title if they've changed.
+		// Only update title when the new value is non-empty (don't blank out existing titles).
+		if title != "" {
+			_, _ = s.db.Exec(`
+				UPDATE conversations SET conversation_type = ?, title = ?, updated_at = datetime('now')
+				WHERE id = ? AND (conversation_type != ? OR title != ? OR title IS NULL)
+			`, conversationType, title, id, conversationType, title)
+		} else {
+			_, _ = s.db.Exec(`
+				UPDATE conversations SET conversation_type = ?, updated_at = datetime('now')
+				WHERE id = ? AND conversation_type != ?
+			`, conversationType, id, conversationType)
+		}
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return 0, err
+	}
+
+	// Create new
+	result, err := s.db.Exec(`
+		INSERT INTO conversations (source_id, source_conversation_id, conversation_type, title, created_at, updated_at)
+		VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+	`, sourceID, sourceConversationID, conversationType, title)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.LastInsertId()
+}
+
+// EnsureParticipantByPhone gets or creates a participant by phone number.
+// Phone must start with "+" (E.164 format). Returns an error for empty or
+// invalid phone numbers to prevent database pollution.
+// Also creates a participant_identifiers row with the given identifierType
+// (e.g., "whatsapp", "imessage", "google_voice").
+func (s *Store) EnsureParticipantByPhone(phone, displayName, identifierType string) (int64, error) {
+	if phone == "" {
+		return 0, fmt.Errorf("phone number is required")
+	}
+	if !strings.HasPrefix(phone, "+") {
+		return 0, fmt.Errorf("phone number must be in E.164 format (starting with +), got %q", phone)
+	}
+
+	// Try to get existing by phone
+	var id int64
+	err := s.db.QueryRow(`
+		SELECT id FROM participants WHERE phone_number = ?
+	`, phone).Scan(&id)
+
+	if err == nil {
+		// Update display name if provided and currently empty
+		if displayName != "" {
+			_, _ = s.db.Exec(`
+				UPDATE participants SET display_name = ?
+				WHERE id = ? AND (display_name IS NULL OR display_name = '')
+			`, displayName, id) // best-effort display name update, ignore error
+		}
+	} else if err != sql.ErrNoRows {
+		return 0, err
+	} else {
+		// Create new participant
+		result, err := s.db.Exec(`
+			INSERT INTO participants (phone_number, display_name, created_at, updated_at)
+			VALUES (?, ?, datetime('now'), datetime('now'))
+		`, phone, displayName)
+		if err != nil {
+			return 0, fmt.Errorf("insert participant: %w", err)
+		}
+
+		id, err = result.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	// Ensure a participant_identifiers row exists for this identifierType.
+	// INSERT OR IGNORE is idempotent: a second call with the same type is a no-op.
+	_, err = s.db.Exec(`
+		INSERT OR IGNORE INTO participant_identifiers (participant_id, identifier_type, identifier_value, is_primary)
+		VALUES (?, ?, ?, TRUE)
+	`, id, identifierType, phone)
+	if err != nil {
+		return 0, fmt.Errorf("insert participant identifier: %w", err)
+	}
+
+	return id, nil
+}
+
+// UpdateParticipantDisplayNameByPhone updates the display_name for an existing
+// participant identified by phone number. Only updates if display_name is currently
+// empty. Returns true if a participant was found and updated, false if not found
+// or name was already set. Does NOT create new participants.
+func (s *Store) UpdateParticipantDisplayNameByPhone(phone, displayName string) (bool, error) {
+	if phone == "" || displayName == "" {
+		return false, nil
+	}
+
+	result, err := s.db.Exec(`
+		UPDATE participants SET display_name = ?, updated_at = datetime('now')
+		WHERE phone_number = ? AND (display_name IS NULL OR display_name = '')
+	`, displayName, phone)
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// EnsureConversationParticipant adds a participant to a conversation.
+// Uses INSERT OR IGNORE to be idempotent.
+func (s *Store) EnsureConversationParticipant(conversationID, participantID int64, role string) error {
+	_, err := s.db.Exec(`
+		INSERT OR IGNORE INTO conversation_participants (conversation_id, participant_id, role, joined_at)
+		VALUES (?, ?, ?, datetime('now'))
+	`, conversationID, participantID, role)
+	return err
+}
+
+// UpsertReaction inserts or ignores a reaction.
+func (s *Store) UpsertReaction(messageID, participantID int64, reactionType, reactionValue string, createdAt time.Time) error {
+	_, err := s.db.Exec(`
+		INSERT OR IGNORE INTO reactions (message_id, participant_id, reaction_type, reaction_value, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, messageID, participantID, reactionType, reactionValue, createdAt)
+	return err
+}
+
+// UpsertMessageRawWithFormat stores compressed raw data with an explicit format.
+// Unlike UpsertMessageRaw (which hardcodes 'mime'), this accepts the format as a parameter.
+func (s *Store) UpsertMessageRawWithFormat(messageID int64, rawData []byte, format string) error {
+	// Compress with zlib
+	var compressed bytes.Buffer
+	w := zlib.NewWriter(&compressed)
+	if _, err := w.Write(rawData); err != nil {
+		return fmt.Errorf("compress: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close compressor: %w", err)
+	}
+
+	_, err := s.db.Exec(`
+		INSERT INTO message_raw (message_id, raw_data, raw_format, compression)
+		VALUES (?, ?, ?, 'zlib')
+		ON CONFLICT(message_id) DO UPDATE SET
+			raw_data = excluded.raw_data,
+			raw_format = excluded.raw_format,
+			compression = excluded.compression
+	`, messageID, compressed.Bytes(), format)
+	return err
 }
 
 // UpsertAttachment stores an attachment record.

@@ -19,7 +19,7 @@ func createTestAccountsDB(t *testing.T, accounts []testAccount) string {
 	if err != nil {
 		t.Fatalf("create test db: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_, err = db.Exec(`
 		CREATE TABLE ZACCOUNT (
@@ -59,6 +59,13 @@ type testAccount struct {
 func strPtr(s string) *string { return &s }
 func intPtr(i int) *int       { return &i }
 
+func mustMkdirAll(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("mkdir %q: %v", path, err)
+	}
+}
+
 func TestResolveAccounts(t *testing.T) {
 	// Set up accounts mimicking real Accounts4.sqlite:
 	// - PK 1: Google parent (has email, description "Google")
@@ -67,6 +74,8 @@ func TestResolveAccounts(t *testing.T) {
 	// - PK 4: IMAP child of Yahoo (GUID, no email, inherits from parent)
 	// - PK 5: Exchange account (GUID, has own email)
 	// - PK 6: "On My Mac" (GUID, no email, description only)
+	// - PK 7: iCloud parent (has email, description "iCloud")
+	// - PK 8: IMAP child of iCloud with empty-string fields (not NULL)
 	accounts := []testAccount{
 		{pk: 1, identifier: "google-parent-id", username: strPtr("user@gmail.com"), description: strPtr("Google"), parentAccount: nil},
 		{pk: 2, identifier: "13C9A646-1234-5678-9ABC-E07FFBDDEED3", username: nil, description: nil, parentAccount: intPtr(1)},
@@ -74,6 +83,8 @@ func TestResolveAccounts(t *testing.T) {
 		{pk: 4, identifier: "AABBCCDD-1111-2222-3333-445566778899", username: nil, description: nil, parentAccount: intPtr(3)},
 		{pk: 5, identifier: "EXCHANGE1-AAAA-BBBB-CCCC-DDDDEEEEEEEE", username: strPtr("user@exchange.com"), description: strPtr("Exchange"), parentAccount: nil},
 		{pk: 6, identifier: "LOCALONLY-0000-0000-0000-000000000000", username: nil, description: strPtr("On My Mac"), parentAccount: nil},
+		{pk: 7, identifier: "icloud-parent-id", username: strPtr("user@icloud.com"), description: strPtr("iCloud"), parentAccount: nil},
+		{pk: 8, identifier: "ICLOUDCH-1111-2222-3333-444455556666", username: strPtr(""), description: strPtr(""), parentAccount: intPtr(7)},
 	}
 
 	dbPath := createTestAccountsDB(t, accounts)
@@ -143,6 +154,17 @@ func TestResolveAccounts(t *testing.T) {
 			wantEmail: map[string]string{
 				"13C9A646-1234-5678-9ABC-E07FFBDDEED3": "user@gmail.com",
 				"AABBCCDD-1111-2222-3333-445566778899": "user@yahoo.com",
+			},
+		},
+		{
+			name:    "Empty-string child fields fall through to parent",
+			guids:   []string{"ICLOUDCH-1111-2222-3333-444455556666"},
+			wantLen: 1,
+			wantEmail: map[string]string{
+				"ICLOUDCH-1111-2222-3333-444455556666": "user@icloud.com",
+			},
+			wantDesc: map[string]string{
+				"ICLOUDCH-1111-2222-3333-444455556666": "iCloud",
 			},
 		},
 		{
@@ -284,48 +306,153 @@ func TestDiscoverV10Accounts(t *testing.T) {
 }
 
 func TestFindV10GUIDs(t *testing.T) {
+	guidA := "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+	guidB := "11111111-2222-3333-4444-555555555555"
+	guidC := "99999999-8888-7777-6666-555544443333"
+
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T, mailDir string)
+		wantGUIDs []string
+	}{
+		{
+			name: "single V10 dir",
+			setup: func(t *testing.T, mailDir string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(mailDir, "V10", guidA))
+				mustMkdirAll(t, filepath.Join(mailDir, "V10", "MailData"))
+			},
+			wantGUIDs: []string{guidA},
+		},
+		{
+			name: "same GUID in V2 and V10 deduplicates",
+			setup: func(t *testing.T, mailDir string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(mailDir, "V2", guidA))
+				mustMkdirAll(t, filepath.Join(mailDir, "V10", guidA))
+			},
+			wantGUIDs: []string{guidA},
+		},
+		{
+			name: "partially populated V10 discovers older-only accounts",
+			setup: func(t *testing.T, mailDir string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(mailDir, "V10", guidA))
+				mustMkdirAll(t, filepath.Join(mailDir, "V9", guidA))
+				mustMkdirAll(t, filepath.Join(mailDir, "V9", guidB))
+			},
+			wantGUIDs: []string{guidA, guidB},
+		},
+		{
+			name: "empty V10 discovers from V9",
+			setup: func(t *testing.T, mailDir string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(mailDir, "V10"))
+				mustMkdirAll(t, filepath.Join(mailDir, "V9", guidC))
+			},
+			wantGUIDs: []string{guidC},
+		},
+		{
+			name: "non-V directory ignored",
+			setup: func(t *testing.T, mailDir string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(mailDir, "Other", guidA))
+			},
+			wantGUIDs: nil,
+		},
+		{
+			name: "non-UUID subdirs ignored",
+			setup: func(t *testing.T, mailDir string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(mailDir, "V10", "MailData"))
+			},
+			wantGUIDs: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mailDir := t.TempDir()
+			tt.setup(t, mailDir)
+
+			guids, err := findV10GUIDs(mailDir)
+			if err != nil {
+				t.Fatalf("findV10GUIDs: %v", err)
+			}
+
+			if len(guids) != len(tt.wantGUIDs) {
+				t.Fatalf("got %d GUIDs %v, want %d %v",
+					len(guids), guids, len(tt.wantGUIDs), tt.wantGUIDs)
+			}
+
+			got := make(map[string]bool)
+			for _, g := range guids {
+				got[g] = true
+			}
+			for _, want := range tt.wantGUIDs {
+				if !got[want] {
+					t.Errorf("missing GUID %s in result %v", want, guids)
+				}
+			}
+		})
+	}
+}
+
+// writeTestEmlx creates a minimal .emlx file at the given path.
+func writeTestEmlx(t *testing.T, dir, name string) {
+	t.Helper()
+	mustMkdirAll(t, dir)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("10\nFrom: x\r\n\r\n"), 0o600); err != nil {
+		t.Fatalf("write %q: %v", path, err)
+	}
+}
+
+func TestV10AccountDir_PrefersPopulated(t *testing.T) {
+	guid := "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
 	mailDir := t.TempDir()
 
-	// Create V10 with UUID dirs plus non-UUID.
-	v10 := filepath.Join(mailDir, "V10")
-	guid := "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
-	if err := os.MkdirAll(filepath.Join(v10, guid), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(v10, "MailData"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// V10 has the GUID dir with an empty .mbox stub (no .emlx files).
+	mustMkdirAll(t, filepath.Join(mailDir, "V10", guid, "INBOX.mbox", "Messages"))
 
-	// Create V2 with another UUID.
-	v2 := filepath.Join(mailDir, "V2")
-	guid2 := "11111111-2222-3333-4444-555555555555"
-	if err := os.MkdirAll(filepath.Join(v2, guid2), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// V9 has actual messages.
+	writeTestEmlx(t,
+		filepath.Join(mailDir, "V9", guid, "INBOX.mbox", "Messages"),
+		"1.emlx",
+	)
 
-	// Non-V directory should be ignored.
-	if err := os.MkdirAll(filepath.Join(mailDir, "Other", "FFFFFFFF-0000-0000-0000-000000000000"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	guids, err := findV10GUIDs(mailDir)
+	got, err := V10AccountDir(mailDir, guid)
 	if err != nil {
-		t.Fatalf("findV10GUIDs: %v", err)
+		t.Fatalf("V10AccountDir: %v", err)
 	}
 
-	if len(guids) != 2 {
-		t.Fatalf("got %d GUIDs, want 2: %v", len(guids), guids)
+	want := filepath.Join(mailDir, "V9", guid)
+	if got != want {
+		t.Errorf("got %q, want %q (should prefer populated V9 over empty V10)", got, want)
+	}
+}
+
+func TestV10AccountDir_NewestPopulatedWins(t *testing.T) {
+	guid := "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+	mailDir := t.TempDir()
+
+	// Both have actual messages; newest wins.
+	writeTestEmlx(t,
+		filepath.Join(mailDir, "V10", guid, "INBOX.mbox", "Messages"),
+		"1.emlx",
+	)
+	writeTestEmlx(t,
+		filepath.Join(mailDir, "V9", guid, "INBOX.mbox", "Messages"),
+		"1.emlx",
+	)
+
+	got, err := V10AccountDir(mailDir, guid)
+	if err != nil {
+		t.Fatalf("V10AccountDir: %v", err)
 	}
 
-	seen := make(map[string]bool)
-	for _, g := range guids {
-		seen[g] = true
-	}
-
-	if !seen[guid] {
-		t.Errorf("expected GUID %s", guid)
-	}
-	if !seen[guid2] {
-		t.Errorf("expected GUID %s", guid2)
+	want := filepath.Join(mailDir, "V10", guid)
+	if got != want {
+		t.Errorf("got %q, want %q (newest populated should win)", got, want)
 	}
 }

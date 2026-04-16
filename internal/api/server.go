@@ -18,6 +18,7 @@ import (
 	"github.com/wesm/msgvault/internal/deletion"
 	"github.com/wesm/msgvault/internal/query"
 	"github.com/wesm/msgvault/internal/scheduler"
+	"github.com/wesm/msgvault/internal/search"
 	"github.com/wesm/msgvault/internal/store"
 	"github.com/wesm/msgvault/internal/web"
 )
@@ -28,6 +29,7 @@ type MessageStore interface {
 	ListMessages(offset, limit int) ([]APIMessage, int64, error)
 	GetMessage(id int64) (*APIMessage, error)
 	SearchMessages(query string, offset, limit int) ([]APIMessage, int64, error)
+	SearchMessagesQuery(q *search.Query, offset, limit int) ([]APIMessage, int64, error)
 }
 
 // StoreStats is an alias for store.Stats — single source of truth.
@@ -47,37 +49,44 @@ type AccountStatus = scheduler.AccountStatus
 
 // Server represents the HTTP API server.
 type Server struct {
-	cfg         *config.Config
-	store       MessageStore
-	scheduler   SyncScheduler
-	engine      query.Engine // optional: enables web UI when set
-	logger      *slog.Logger
+	cfg       *config.Config
+	store     MessageStore
+	engine    query.Engine // Query engine for aggregates, TUI, and web UI support
+	scheduler SyncScheduler
+	logger    *slog.Logger
 	router      chi.Router
 	server      *http.Server
 	rateLimiter *RateLimiter
 	cfgMu       sync.RWMutex // protects cfg.Accounts
 }
 
-// ServerOption configures the API server.
-type ServerOption func(*Server)
-
-// WithQueryEngine enables the web UI by providing a query engine.
-func WithQueryEngine(engine query.Engine) ServerOption {
-	return func(s *Server) {
-		s.engine = engine
-	}
+// ServerOptions configures the API server.
+type ServerOptions struct {
+	Config    *config.Config
+	Store     MessageStore
+	Engine    query.Engine // Optional: query engine for aggregates, TUI, and web UI support
+	Scheduler SyncScheduler
+	Logger    *slog.Logger
 }
 
 // NewServer creates a new API server.
-func NewServer(cfg *config.Config, store MessageStore, sched SyncScheduler, logger *slog.Logger, opts ...ServerOption) *Server {
+func NewServer(cfg *config.Config, store MessageStore, sched SyncScheduler, logger *slog.Logger) *Server {
+	return NewServerWithOptions(ServerOptions{
+		Config:    cfg,
+		Store:     store,
+		Scheduler: sched,
+		Logger:    logger,
+	})
+}
+
+// NewServerWithOptions creates a new API server with full options including query engine.
+func NewServerWithOptions(opts ServerOptions) *Server {
 	s := &Server{
-		cfg:       cfg,
-		store:     store,
-		scheduler: sched,
-		logger:    logger,
-	}
-	for _, opt := range opts {
-		opt(s)
+		cfg:       opts.Config,
+		store:     opts.Store,
+		engine:    opts.Engine,
+		scheduler: opts.Scheduler,
+		logger:    opts.Logger,
 	}
 	s.router = s.setupRouter()
 	return s
@@ -128,6 +137,15 @@ func (s *Server) setupRouter() chi.Router {
 
 		// Search
 		r.Get("/search", s.handleSearch)
+
+		// TUI aggregate endpoints (require query engine)
+		r.Post("/query", s.handleQuery)
+		r.Get("/aggregates", s.handleAggregates)
+		r.Get("/aggregates/sub", s.handleSubAggregates)
+		r.Get("/messages/filter", s.handleFilteredMessages)
+		r.Get("/stats/total", s.handleTotalStats)
+		r.Get("/search/fast", s.handleFastSearch)
+		r.Get("/search/deep", s.handleDeepSearch)
 
 		// Accounts and sync
 		r.Get("/accounts", s.handleListAccounts)

@@ -5,19 +5,25 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/wesm/msgvault/internal/search"
 )
 
 // APIMessage represents a message for API responses.
 type APIMessage struct {
 	ID             int64
+	ConversationID int64
 	Subject        string
 	From           string
 	To             []string
+	Cc             []string
+	Bcc            []string
 	SentAt         time.Time
 	Snippet        string
 	Labels         []string
 	HasAttachments bool
 	SizeEstimate   int64
+	DeletedAt      *time.Time
 	Body           string
 	Headers        map[string]string
 	Attachments    []APIAttachment
@@ -43,6 +49,7 @@ func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
 	query := `
 		SELECT
 			m.id,
+			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
@@ -61,7 +68,7 @@ func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	// Use scanMessageRows for robust date parsing
 	messages, ids, err := scanMessageRows(rows)
@@ -73,21 +80,9 @@ func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
 		return messages, total, nil
 	}
 
-	// Batch-load recipients for all messages
-	recipientMap, err := s.batchGetRecipients(ids, "to")
-	if err != nil {
+	// Batch-load recipients and labels for all messages
+	if err := s.batchPopulate(messages, ids); err != nil {
 		return nil, 0, err
-	}
-
-	// Batch-load labels for all messages
-	labelMap, err := s.batchGetLabels(ids)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	for i := range messages {
-		messages[i].To = recipientMap[messages[i].ID]
-		messages[i].Labels = labelMap[messages[i].ID]
 	}
 
 	return messages, total, nil
@@ -99,21 +94,24 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 	query := `
 		SELECT
 			m.id,
+			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
 			m.has_attachments,
-			m.size_estimate
+			m.size_estimate,
+			m.deleted_from_source_at
 		FROM messages m
 		LEFT JOIN message_recipients mr ON mr.message_id = m.id AND mr.recipient_type = 'from'
 		LEFT JOIN participants p ON p.id = mr.participant_id
-		WHERE m.id = ? AND m.deleted_from_source_at IS NULL
+		WHERE m.id = ?
 	`
 
 	var m APIMessage
 	var sentAtStr sql.NullString
-	err := s.db.QueryRow(query, id).Scan(&m.ID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate)
+	var deletedAtStr sql.NullString
+	err := s.db.QueryRow(query, id).Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate, &deletedAtStr)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -123,9 +121,21 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 	if sentAtStr.Valid && sentAtStr.String != "" {
 		m.SentAt = parseSQLiteTime(sentAtStr.String)
 	}
+	if deletedAtStr.Valid && deletedAtStr.String != "" {
+		deletedAt := parseSQLiteTime(deletedAtStr.String)
+		m.DeletedAt = &deletedAt
+	}
 
 	// Get recipients (single message, per-row is fine)
 	m.To, err = s.getRecipients(m.ID, "to")
+	if err != nil {
+		return nil, err
+	}
+	m.Cc, err = s.getRecipients(m.ID, "cc")
+	if err != nil {
+		return nil, err
+	}
+	m.Bcc, err = s.getRecipients(m.ID, "bcc")
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +161,7 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 	// Get attachments
 	attRows, err := s.db.Query("SELECT filename, mime_type, size FROM attachments WHERE message_id = ?", id)
 	if err == nil {
-		defer attRows.Close()
+		defer func() { _ = attRows.Close() }()
 		for attRows.Next() {
 			var att APIAttachment
 			if err := attRows.Scan(&att.Filename, &att.MimeType, &att.Size); err == nil {
@@ -171,6 +181,7 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 	ftsQuery := `
 		SELECT
 			m.id,
+			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
@@ -191,7 +202,7 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 		// FTS5 might not be available, fall back to LIKE search
 		return s.searchMessagesLike(query, offset, limit)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	messages, ids, err := scanMessageRows(rows)
 	if err != nil {
@@ -222,6 +233,214 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 	return messages, total, nil
 }
 
+// SearchMessagesQuery searches messages using a parsed query with
+// support for structured operators (from:, to:, label:, etc.).
+func (s *Store) SearchMessagesQuery(
+	q *search.Query, offset, limit int,
+) ([]APIMessage, int64, error) {
+	var conditions []string
+	var args []interface{}
+
+	conditions = append(conditions,
+		"m.deleted_from_source_at IS NULL")
+
+	// FTS5 text terms.
+	ftsJoin := ""
+	if len(q.TextTerms) > 0 {
+		ftsExpr := buildFTSExpression(q.TextTerms)
+		ftsJoin = "JOIN messages_fts fts ON fts.rowid = m.id"
+		conditions = append(conditions, "messages_fts MATCH ?")
+		args = append(args, ftsExpr)
+	}
+
+	// from: filter
+	for _, addr := range q.FromAddrs {
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_recipients mr2
+			JOIN participants p2 ON p2.id = mr2.participant_id
+			WHERE mr2.message_id = m.id
+			AND mr2.recipient_type = 'from'
+			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
+		)`)
+		args = append(args,
+			"%"+escapeLike(strings.ToLower(addr))+"%")
+	}
+
+	// to: filter
+	for _, addr := range q.ToAddrs {
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_recipients mr2
+			JOIN participants p2 ON p2.id = mr2.participant_id
+			WHERE mr2.message_id = m.id
+			AND mr2.recipient_type = 'to'
+			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
+		)`)
+		args = append(args,
+			"%"+escapeLike(strings.ToLower(addr))+"%")
+	}
+
+	// cc: filter
+	for _, addr := range q.CcAddrs {
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_recipients mr2
+			JOIN participants p2 ON p2.id = mr2.participant_id
+			WHERE mr2.message_id = m.id
+			AND mr2.recipient_type = 'cc'
+			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
+		)`)
+		args = append(args,
+			"%"+escapeLike(strings.ToLower(addr))+"%")
+	}
+
+	// bcc: filter
+	for _, addr := range q.BccAddrs {
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_recipients mr2
+			JOIN participants p2 ON p2.id = mr2.participant_id
+			WHERE mr2.message_id = m.id
+			AND mr2.recipient_type = 'bcc'
+			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
+		)`)
+		args = append(args,
+			"%"+escapeLike(strings.ToLower(addr))+"%")
+	}
+
+	// label: filter
+	for _, lbl := range q.Labels {
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_labels ml2
+			JOIN labels l2 ON l2.id = ml2.label_id
+			WHERE ml2.message_id = m.id
+			AND LOWER(l2.name) LIKE ? ESCAPE '\'
+		)`)
+		args = append(args,
+			"%"+escapeLike(strings.ToLower(lbl))+"%")
+	}
+
+	// subject: filter
+	for _, term := range q.SubjectTerms {
+		conditions = append(conditions,
+			`m.subject LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(term)+"%")
+	}
+
+	// has:attachment
+	if q.HasAttachment != nil && *q.HasAttachment {
+		conditions = append(conditions,
+			"m.has_attachments = 1")
+	}
+
+	// larger: / smaller:
+	if q.LargerThan != nil {
+		conditions = append(conditions, "m.size_estimate > ?")
+		args = append(args, *q.LargerThan)
+	}
+	if q.SmallerThan != nil {
+		conditions = append(conditions, "m.size_estimate < ?")
+		args = append(args, *q.SmallerThan)
+	}
+
+	// after: / before:
+	if q.AfterDate != nil {
+		conditions = append(conditions,
+			"COALESCE(m.sent_at, m.received_at, m.internal_date) >= ?")
+		args = append(args, q.AfterDate.Format(time.RFC3339))
+	}
+	if q.BeforeDate != nil {
+		conditions = append(conditions,
+			"COALESCE(m.sent_at, m.received_at, m.internal_date) < ?")
+		args = append(args, q.BeforeDate.Format(time.RFC3339))
+	}
+
+	whereClause := strings.Join(conditions, " AND ")
+
+	// Count query.
+	countSQL := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM messages m
+		%s
+		WHERE %s
+	`, ftsJoin, whereClause)
+
+	var total int64
+	if err := s.db.QueryRow(countSQL, args...).Scan(&total); err != nil {
+		if ftsJoin != "" {
+			return s.searchMessagesQueryNoFTS(q, offset, limit)
+		}
+		return nil, 0, fmt.Errorf("count search results: %w", err)
+	}
+
+	// Results query.
+	orderBy := "COALESCE(m.sent_at, m.received_at, m.internal_date) DESC"
+	if ftsJoin != "" {
+		orderBy = "rank, " + orderBy
+	}
+	searchSQL := fmt.Sprintf(`
+		SELECT
+			m.id,
+			COALESCE(m.conversation_id, 0) as conversation_id,
+			COALESCE(m.subject, '') as subject,
+			COALESCE(p.email_address, '') as from_email,
+			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
+			COALESCE(m.snippet, '') as snippet,
+			m.has_attachments,
+			m.size_estimate
+		FROM messages m
+		%s
+		LEFT JOIN message_recipients mr
+			ON mr.message_id = m.id AND mr.recipient_type = 'from'
+		LEFT JOIN participants p ON p.id = mr.participant_id
+		WHERE %s
+		ORDER BY %s
+		LIMIT ? OFFSET ?
+	`, ftsJoin, whereClause, orderBy)
+
+	resultArgs := make([]interface{}, len(args))
+	copy(resultArgs, args)
+	resultArgs = append(resultArgs, limit, offset)
+	rows, err := s.db.Query(searchSQL, resultArgs...)
+	if err != nil {
+		// FTS5 not available -- fall back if we used it.
+		if ftsJoin != "" {
+			return s.searchMessagesQueryNoFTS(q, offset, limit)
+		}
+		return nil, 0, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	messages, ids, err := scanMessageRows(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if len(ids) > 0 {
+		if err := s.batchPopulate(messages, ids); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	return messages, total, nil
+}
+
+// buildFTSExpression builds an FTS5 MATCH expression from text terms.
+func buildFTSExpression(terms []string) string {
+	quoted := make([]string, len(terms))
+	for i, t := range terms {
+		quoted[i] = `"` + strings.ReplaceAll(t, `"`, `""`) + `"`
+	}
+	return strings.Join(quoted, " AND ")
+}
+
+// searchMessagesQueryNoFTS is a fallback when FTS5 is unavailable.
+func (s *Store) searchMessagesQueryNoFTS(
+	q *search.Query, offset, limit int,
+) ([]APIMessage, int64, error) {
+	fallbackQ := *q
+	fallbackQ.SubjectTerms = append(fallbackQ.SubjectTerms, q.TextTerms...)
+	fallbackQ.TextTerms = nil
+	return s.SearchMessagesQuery(&fallbackQ, offset, limit)
+}
+
 // escapeLike escapes SQL LIKE special characters (%, _) so they are
 // matched literally. The escaped string should be used with ESCAPE '\'.
 func escapeLike(s string) string {
@@ -248,6 +467,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 	searchQuery := `
 		SELECT
 			m.id,
+			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(m.subject, '') as subject,
 			COALESCE(p.email_address, '') as from_email,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
@@ -267,7 +487,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	messages, ids, err := scanMessageRows(rows)
 	if err != nil {
@@ -286,7 +506,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 	return messages, total, nil
 }
 
-// scanMessageRows scans the standard 7-column message row set.
+// scanMessageRows scans the standard 8-column message row set.
 // Uses string scanning for dates to handle all SQLite datetime formats robustly.
 func scanMessageRows(rows *sql.Rows) ([]APIMessage, []int64, error) {
 	var messages []APIMessage
@@ -294,7 +514,7 @@ func scanMessageRows(rows *sql.Rows) ([]APIMessage, []int64, error) {
 	for rows.Next() {
 		var m APIMessage
 		var sentAtStr sql.NullString
-		err := rows.Scan(&m.ID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate)
+		err := rows.Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -341,12 +561,22 @@ func (s *Store) batchPopulate(messages []APIMessage, ids []int64) error {
 	if err != nil {
 		return err
 	}
+	ccMap, err := s.batchGetRecipients(ids, "cc")
+	if err != nil {
+		return err
+	}
+	bccMap, err := s.batchGetRecipients(ids, "bcc")
+	if err != nil {
+		return err
+	}
 	labelMap, err := s.batchGetLabels(ids)
 	if err != nil {
 		return err
 	}
 	for i := range messages {
 		messages[i].To = recipientMap[messages[i].ID]
+		messages[i].Cc = ccMap[messages[i].ID]
+		messages[i].Bcc = bccMap[messages[i].ID]
 		messages[i].Labels = labelMap[messages[i].ID]
 	}
 	return nil
@@ -377,7 +607,7 @@ func (s *Store) batchGetRecipients(messageIDs []int64, recipientType string) (ma
 	if err != nil {
 		return nil, fmt.Errorf("batch get recipients: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make(map[int64][]string, len(messageIDs))
 	for rows.Next() {
@@ -420,7 +650,7 @@ func (s *Store) batchGetLabels(messageIDs []int64) (map[int64][]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("batch get labels: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make(map[int64][]string, len(messageIDs))
 	for rows.Next() {
@@ -450,7 +680,7 @@ func (s *Store) getRecipients(messageID int64, recipientType string) ([]string, 
 	if err != nil {
 		return nil, fmt.Errorf("get recipients: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var recipients []string
 	for rows.Next() {
@@ -479,7 +709,7 @@ func (s *Store) getLabels(messageID int64) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get labels: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var labels []string
 	for rows.Next() {

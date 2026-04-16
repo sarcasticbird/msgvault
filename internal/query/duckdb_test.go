@@ -35,7 +35,7 @@ func newSQLiteEngine(t *testing.T) *DuckDBEngine {
 	if err != nil {
 		t.Fatalf("NewDuckDBEngine: %v", err)
 	}
-	t.Cleanup(func() { engine.Close() })
+	t.Cleanup(func() { _ = engine.Close() })
 	return engine
 }
 
@@ -193,7 +193,7 @@ func TestDuckDBEngine_SQLiteEngineReuse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDuckDBEngine: %v", err)
 	}
-	defer engine.Close()
+	defer func() { _ = engine.Close() }()
 
 	// Verify sqliteEngine was created
 	if engine.sqliteEngine == nil {
@@ -304,7 +304,7 @@ func TestDuckDBEngine_SQLiteEngineFTSCacheReuse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDuckDBEngine: %v", err)
 	}
-	defer engine.Close()
+	defer func() { _ = engine.Close() }()
 
 	// Capture the shared engine to verify cache state
 	sharedEngine := engine.sqliteEngine
@@ -377,7 +377,7 @@ func TestDuckDBEngine_NoSQLiteDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDuckDBEngine: %v", err)
 	}
-	defer engine.Close()
+	defer func() { _ = engine.Close() }()
 
 	// sqliteEngine should be nil
 	if engine.sqliteEngine != nil {
@@ -452,7 +452,7 @@ func TestDuckDBEngine_DeletedMessagesIncluded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDuckDBEngine: %v", err)
 	}
-	t.Cleanup(func() { engine.Close() })
+	t.Cleanup(func() { _ = engine.Close() })
 
 	ctx := context.Background()
 
@@ -490,7 +490,7 @@ func TestDuckDBEngine_SearchHideDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDuckDBEngine: %v", err)
 	}
-	t.Cleanup(func() { engine.Close() })
+	t.Cleanup(func() { _ = engine.Close() })
 
 	ctx := context.Background()
 
@@ -1136,7 +1136,7 @@ func TestDuckDBEngine_ThreadCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDuckDBEngine: %v", err)
 	}
-	defer engine.Close()
+	defer func() { _ = engine.Close() }()
 
 	// Query the current thread setting
 	var threads int
@@ -1718,7 +1718,7 @@ func TestDuckDBEngine_GetGmailIDsByFilter_NoDataSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDuckDBEngine: %v", err)
 	}
-	defer engine.Close()
+	defer func() { _ = engine.Close() }()
 
 	ctx := context.Background()
 	_, err = engine.GetGmailIDsByFilter(ctx, MessageFilter{Sender: "test@example.com"})
@@ -1839,7 +1839,7 @@ func TestBuildWhereClause_SearchOperators(t *testing.T) {
 		{
 			name:        "text terms",
 			searchQuery: "hello world",
-			wantClauses: []string{"msg.subject ILIKE", "ESCAPE"},
+			wantClauses: []string{"msg.subject ILIKE"},
 		},
 		{
 			name:        "from operator",
@@ -1899,7 +1899,7 @@ func TestBuildWhereClause_EscapedArgs(t *testing.T) {
 	opts := AggregateOptions{SearchQuery: "100%_off"}
 	_, args := engine.buildWhereClause(opts)
 
-	// The escaped pattern should appear in args
+	// With ILIKE search, % and _ are escaped with backslash.
 	found := false
 	for _, arg := range args {
 		if s, ok := arg.(string); ok && strings.Contains(s, "100\\%\\_off") {
@@ -1908,7 +1908,46 @@ func TestBuildWhereClause_EscapedArgs(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("expected escaped pattern '100\\%%\\_off' in args, got: %v", args)
+		t.Errorf("expected ILIKE pattern containing '100\\%%\\_off' in args, got: %v", args)
+	}
+}
+
+// TestBuildWhereClause_ILIKEEscape verifies that search terms are properly
+// escaped for ILIKE patterns in aggregate search conditions.
+func TestBuildWhereClause_ILIKEEscape(t *testing.T) {
+	engine := &DuckDBEngine{}
+
+	tests := []struct {
+		name    string
+		term    string
+		wantArg string // expected ILIKE arg pattern
+	}{
+		{"word_char_letter", "hello", "%hello%"},
+		{"word_char_digit", "123", "%123%"},
+		{"word_char_underscore", "_test", "%\\_test%"},
+		{"non_word_plus", "+15551234567", "%+15551234567%"},
+		{"non_word_at", "@gmail.com", "%@gmail.com%"},
+		{"non_word_hash", "#bug", "%#bug%"},
+		{"wildcard_percent", "100%off", "%100\\%off%"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := AggregateOptions{SearchQuery: tc.term}
+			_, args := engine.buildWhereClause(opts)
+
+			found := false
+			for _, arg := range args {
+				if s, ok := arg.(string); ok && s == tc.wantArg {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("term %q: expected arg %q, got %v",
+					tc.term, tc.wantArg, args)
+			}
+		})
 	}
 }
 
@@ -2007,7 +2046,7 @@ func TestAggregateByLabel_WithLabelSearch(t *testing.T) {
 }
 
 // TestBuildSearchConditions_EscapedWildcards verifies that buildSearchConditions
-// escapes ILIKE wildcards and uses ESCAPE clause for all text patterns.
+// escapes wildcards: ILIKE ESCAPE for TextTerms and operators.
 func TestBuildSearchConditions_EscapedWildcards(t *testing.T) {
 	engine := &DuckDBEngine{}
 
@@ -2022,7 +2061,7 @@ func TestBuildSearchConditions_EscapedWildcards(t *testing.T) {
 			query: &search.Query{
 				TextTerms: []string{"100%_off"},
 			},
-			wantClauses: []string{"ESCAPE '\\'"},
+			wantClauses: []string{"msg.subject ILIKE"},
 			wantInArgs:  []string{"100\\%\\_off"},
 		},
 		{
@@ -2030,7 +2069,7 @@ func TestBuildSearchConditions_EscapedWildcards(t *testing.T) {
 			query: &search.Query{
 				FromAddrs: []string{"test_user%"},
 			},
-			wantClauses: []string{"ms.from_email ILIKE", "ESCAPE"},
+			wantClauses: []string{"p.email_address ILIKE", "ESCAPE"},
 			wantInArgs:  []string{"test\\_user\\%"},
 		},
 		{
@@ -2077,6 +2116,53 @@ func TestBuildSearchConditions_EscapedWildcards(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBuildSearchConditions_UsesILIKENotRegex verifies that the fast search
+// path uses ILIKE (fast on Parquet scans) instead of regexp_matches (slow).
+func TestBuildSearchConditions_UsesILIKENotRegex(t *testing.T) {
+	engine := &DuckDBEngine{}
+
+	q := &search.Query{TextTerms: []string{"hello"}}
+	conditions, args := engine.buildSearchConditions(q, MessageFilter{})
+	where := strings.Join(conditions, " AND ")
+
+	// Must use ILIKE, not regexp_matches
+	if strings.Contains(where, "regexp_matches") {
+		t.Errorf("fast search path should use ILIKE, not regexp_matches\ngot: %s", where)
+	}
+	if !strings.Contains(where, "ILIKE") {
+		t.Errorf("fast search path should contain ILIKE\ngot: %s", where)
+	}
+
+	// Args should be ILIKE patterns (%%term%%), not regex patterns
+	for _, arg := range args {
+		if s, ok := arg.(string); ok && strings.Contains(s, "(?i)") {
+			t.Errorf("fast search args should not contain regex patterns, got: %q", s)
+		}
+	}
+}
+
+// TestBuildAggregateSearchConditions_UsesILIKENotRegex verifies that the
+// aggregate search path also uses ILIKE instead of regexp_matches.
+func TestBuildAggregateSearchConditions_UsesILIKENotRegex(t *testing.T) {
+	engine := &DuckDBEngine{}
+
+	conditions, args := engine.buildAggregateSearchConditions("hello world")
+	where := strings.Join(conditions, " AND ")
+
+	if strings.Contains(where, "regexp_matches") {
+		t.Errorf("aggregate search should use ILIKE, not regexp_matches\ngot: %s", where)
+	}
+	if !strings.Contains(where, "ILIKE") {
+		t.Errorf("aggregate search should contain ILIKE\ngot: %s", where)
+	}
+
+	for _, arg := range args {
+		if s, ok := arg.(string); ok && strings.Contains(s, "(?i)") {
+			t.Errorf("aggregate search args should not contain regex patterns, got: %q", s)
+		}
 	}
 }
 
@@ -2156,16 +2242,16 @@ func TestDuckDBEngine_AggregateByRecipientName_EmptyStringFallback(t *testing.T)
 	// Build Parquet data with empty-string and whitespace display_names on recipients
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Hello', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, NULL::TIMESTAMP, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'World', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, NULL::TIMESTAMP, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Hello', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, 'email', 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'World', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, 'email', 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
-			(1::BIGINT, 'test@gmail.com')
+			(1::BIGINT, 'test@gmail.com', 'gmail')
 		`).
 		addTable("participants", "participants", "participants.parquet", participantsCols, `
-			(1::BIGINT, 'sender@test.com', 'test.com', 'Sender'),
-			(2::BIGINT, 'empty@test.com', 'test.com', ''),
-			(3::BIGINT, 'spaces@test.com', 'test.com', '   ')
+			(1::BIGINT, 'sender@test.com', 'test.com', 'Sender', ''),
+			(2::BIGINT, 'empty@test.com', 'test.com', '', ''),
+			(3::BIGINT, 'spaces@test.com', 'test.com', '   ', '')
 		`).
 		addTable("message_recipients", "message_recipients", "message_recipients.parquet", messageRecipientsCols, `
 			(1::BIGINT, 1::BIGINT, 'from', 'Sender'),
@@ -2177,8 +2263,8 @@ func TestDuckDBEngine_AggregateByRecipientName_EmptyStringFallback(t *testing.T)
 		addEmptyTable("message_labels", "message_labels", "message_labels.parquet", messageLabelsCols, `(1::BIGINT, 1::BIGINT)`).
 		addEmptyTable("attachments", "attachments", "attachments.parquet", attachmentsCols, `(1::BIGINT, 100::BIGINT, 'x')`).
 		addTable("conversations", "conversations", "conversations.parquet", conversationsCols, `
-			(100::BIGINT, 'thread100'),
-			(101::BIGINT, 'thread101')
+			(100::BIGINT, 'thread100', ''),
+			(101::BIGINT, 'thread101', '')
 		`))
 
 	ctx := context.Background()
@@ -2208,15 +2294,15 @@ func TestDuckDBEngine_ListMessages_MatchEmptyRecipientName(t *testing.T) {
 	// Build Parquet data with a message that has no recipients
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Has Recipient', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, NULL::TIMESTAMP, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'No Recipient', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, NULL::TIMESTAMP, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Has Recipient', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, 'email', 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'No Recipient', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, 'email', 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
-			(1::BIGINT, 'test@gmail.com')
+			(1::BIGINT, 'test@gmail.com', 'gmail')
 		`).
 		addTable("participants", "participants", "participants.parquet", participantsCols, `
-			(1::BIGINT, 'alice@test.com', 'test.com', 'Alice'),
-			(2::BIGINT, 'bob@test.com', 'test.com', 'Bob')
+			(1::BIGINT, 'alice@test.com', 'test.com', 'Alice', ''),
+			(2::BIGINT, 'bob@test.com', 'test.com', 'Bob', '')
 		`).
 		addTable("message_recipients", "message_recipients", "message_recipients.parquet", messageRecipientsCols, `
 			(1::BIGINT, 1::BIGINT, 'from', 'Alice'),
@@ -2226,8 +2312,8 @@ func TestDuckDBEngine_ListMessages_MatchEmptyRecipientName(t *testing.T) {
 		addEmptyTable("message_labels", "message_labels", "message_labels.parquet", messageLabelsCols, `(1::BIGINT, 1::BIGINT)`).
 		addEmptyTable("attachments", "attachments", "attachments.parquet", attachmentsCols, `(1::BIGINT, 100::BIGINT, 'x')`).
 		addTable("conversations", "conversations", "conversations.parquet", conversationsCols, `
-			(100::BIGINT, 'thread100'),
-			(101::BIGINT, 'thread101')
+			(100::BIGINT, 'thread100', ''),
+			(101::BIGINT, 'thread101', '')
 		`))
 
 	ctx := context.Background()
@@ -2302,6 +2388,89 @@ func TestDuckDBEngine_GetTotalStats_GroupByDefault(t *testing.T) {
 	}
 	if stats.MessageCount != 3 {
 		t.Errorf("expected 3 messages for sender search 'alice', got %d", stats.MessageCount)
+	}
+}
+
+// TestBuildStatsSearchConditions_PlaceholderArgCount is a regression test for
+// the mismatch between the number of "?" placeholders emitted and the number
+// of args appended when a stats search mixes text terms with non-text
+// operators (e.g. "hello from:bob@example.com"). Previously,
+// buildStatsSearchConditions called buildAggregateSearchConditions and sliced
+// off the text-term prefix using a hand-tracked arg count — any drift between
+// the count and the actual emit rate would cause aggregate stats queries to
+// fail with unmatched placeholders. The helper now delegates directly to
+// buildNonTextSearchConditions so there is nothing to slice; this test locks
+// the invariant in place by counting "?" placeholders.
+func TestBuildStatsSearchConditions_PlaceholderArgCount(t *testing.T) {
+	engine := &DuckDBEngine{}
+
+	cases := []struct {
+		name    string
+		query   string
+		groupBy ViewType
+	}{
+		{"text only (default)", "hello", ViewSenders},
+		{"text only (recipients)", "hello", ViewRecipients},
+		{"text only (labels)", "hello", ViewLabels},
+		{"text + from (default)", "hello from:bob@example.com", ViewSenders},
+		{"text + from (recipients)", "hello from:bob@example.com", ViewRecipients},
+		{"text + from (labels)", "hello from:bob@example.com", ViewLabels},
+		{"text + from + to", "hello from:a@b.com to:c@d.com", ViewSenders},
+		{"text + subject + label", "hello subject:report label:work", ViewSenders},
+		{"multi-text + from", "hello world from:bob@example.com", ViewSenders},
+		{"non-text only", "from:bob@example.com", ViewSenders},
+		{"empty query", "", ViewSenders},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conditions, args := engine.buildStatsSearchConditions(tc.query, tc.groupBy)
+			where := strings.Join(conditions, " AND ")
+			placeholders := strings.Count(where, "?")
+			if placeholders != len(args) {
+				t.Errorf("placeholder/arg mismatch for query %q (groupBy=%v): %d placeholders vs %d args\nconditions: %s\nargs: %v",
+					tc.query, tc.groupBy, placeholders, len(args), where, args)
+			}
+		})
+	}
+}
+
+// TestBuildAggregateSearchConditions_PlaceholderArgCount locks the same
+// invariant on buildAggregateSearchConditions: the number of "?" placeholders
+// in the emitted WHERE conditions must match the number of args, for any
+// combination of text terms, non-text filters, and keyColumns.
+func TestBuildAggregateSearchConditions_PlaceholderArgCount(t *testing.T) {
+	engine := &DuckDBEngine{}
+
+	cases := []struct {
+		name       string
+		query      string
+		keyColumns []string
+	}{
+		{"text only, no keyColumns", "hello", nil},
+		{"text only, one keyColumn", "hello", []string{"p.email_address"}},
+		{"text only, label keyColumn", "hello", []string{"lbl.name"}},
+		{"text + from", "hello from:bob@example.com", nil},
+		{"text + from + to + subject", "hello from:a@b.com to:c@d.com subject:report", nil},
+		{"text + label (label view)", "hello label:work", []string{"lbl.name"}},
+		{"text + label (non-label view)", "hello label:work", nil},
+		{"multi-text + from + keyColumns", "foo bar from:x@y.com", []string{"p.email_address", "p.display_name"}},
+		{"has:attachment", "has:attachment", nil},
+		{"date filter", "after:2024-01-01 before:2024-12-31", nil},
+		{"size filter", "larger:1000 smaller:5000", nil},
+		{"empty query", "", nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conditions, args := engine.buildAggregateSearchConditions(tc.query, tc.keyColumns...)
+			where := strings.Join(conditions, " AND ")
+			placeholders := strings.Count(where, "?")
+			if placeholders != len(args) {
+				t.Errorf("placeholder/arg mismatch for query %q (keyColumns=%v): %d placeholders vs %d args\nconditions: %s\nargs: %v",
+					tc.query, tc.keyColumns, placeholders, len(args), where, args)
+			}
+		})
 	}
 }
 
@@ -2805,14 +2974,14 @@ func TestDuckDBEngine_VARCHARParquetColumns(t *testing.T) {
 	// string, to reproduce type mismatches in COALESCE, JOINs, and TRY_CAST paths.
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', '100', 'Hello World', 'snippet1', TIMESTAMP '2024-01-15 10:00:00', '1000', '0', NULL::TIMESTAMP, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', '101', 'Goodbye', 'snippet2', TIMESTAMP '2024-01-16 10:00:00', '2000', '1', NULL::TIMESTAMP, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', '100', 'Hello World', 'snippet1', TIMESTAMP '2024-01-15 10:00:00', '1000', '0', '0', NULL::TIMESTAMP, NULL::BIGINT, 'email', 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', '101', 'Goodbye', 'snippet2', TIMESTAMP '2024-01-16 10:00:00', '2000', '1', '0', NULL::TIMESTAMP, NULL::BIGINT, 'email', 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
-			(1::BIGINT, 'test@gmail.com')
+			(1::BIGINT, 'test@gmail.com', 'gmail')
 		`).
 		addTable("participants", "participants", "participants.parquet", participantsCols, `
-			(1::BIGINT, 'alice@test.com', 'test.com', 'Alice')
+			(1::BIGINT, 'alice@test.com', 'test.com', 'Alice', '')
 		`).
 		addTable("message_recipients", "message_recipients", "message_recipients.parquet", messageRecipientsCols, `
 			(1::BIGINT, 1::BIGINT, 'from', 'Alice'),
@@ -2822,8 +2991,8 @@ func TestDuckDBEngine_VARCHARParquetColumns(t *testing.T) {
 		addEmptyTable("message_labels", "message_labels", "message_labels.parquet", messageLabelsCols, `(1::BIGINT, 1::BIGINT)`).
 		addEmptyTable("attachments", "attachments", "attachments.parquet", attachmentsCols, `(1::BIGINT, '100', 'x')`).
 		addTable("conversations", "conversations", "conversations.parquet", conversationsCols, `
-			(100::BIGINT, 'thread100'),
-			(101::BIGINT, 'thread101')
+			(100::BIGINT, 'thread100', ''),
+			(101::BIGINT, 'thread101', '')
 		`))
 
 	ctx := context.Background()
@@ -3207,4 +3376,110 @@ func TestDuckDBEngine_HideDeletedFromSource(t *testing.T) {
 	if stats.MessageCount != 2 {
 		t.Errorf("GetTotalStats with hide-deleted: expected 2 messages, got %d", stats.MessageCount)
 	}
+}
+
+// TestDuckDBEngine_StaleParquetSchema verifies that a DuckDB engine can query
+// Parquet files written BEFORE PR #160 added phone_number, attachment_count,
+// sender_id, and message_type columns. The engine should synthesise sensible
+// defaults instead of failing with a binder error.
+func TestDuckDBEngine_StaleParquetSchema(t *testing.T) {
+	// Old-style column definitions (pre-WhatsApp).
+	const oldMessagesCols = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, deleted_from_source_at, year, month"
+	const oldParticipantsCols = "id, email_address, domain, display_name"
+	const oldConversationsCols = "id, source_conversation_id"
+
+	engine := createEngineFromBuilder(t, newParquetBuilder(t).
+		addTable("messages", "messages/year=2024", "data.parquet", oldMessagesCols, `
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Stale Hello', 'snip1', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, NULL::TIMESTAMP, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'Stale Goodbye', 'snip2', TIMESTAMP '2024-01-16 10:00:00', 2000::BIGINT, true, NULL::TIMESTAMP, 2024, 1)
+		`).
+		addTable("sources", "sources", "sources.parquet", sourcesCols, `
+			(1::BIGINT, 'test@gmail.com', 'gmail')
+		`).
+		addTable("participants", "participants", "participants.parquet", oldParticipantsCols, `
+			(1::BIGINT, 'alice@test.com', 'test.com', 'Alice')
+		`).
+		addTable("message_recipients", "message_recipients", "message_recipients.parquet", messageRecipientsCols, `
+			(1::BIGINT, 1::BIGINT, 'from', 'Alice'),
+			(2::BIGINT, 1::BIGINT, 'from', 'Alice')
+		`).
+		addEmptyTable("labels", "labels", "labels.parquet", labelsCols, `(1::BIGINT, 'x')`).
+		addEmptyTable("message_labels", "message_labels", "message_labels.parquet", messageLabelsCols, `(1::BIGINT, 1::BIGINT)`).
+		addEmptyTable("attachments", "attachments", "attachments.parquet", attachmentsCols, `(1::BIGINT, 100::BIGINT, 'x')`).
+		addTable("conversations", "conversations", "conversations.parquet", oldConversationsCols, `
+			(100::BIGINT, 'thread100'),
+			(101::BIGINT, 'thread101')
+		`))
+
+	ctx := context.Background()
+
+	t.Run("ListMessages", func(t *testing.T) {
+		results, err := engine.ListMessages(ctx, MessageFilter{})
+		if err != nil {
+			t.Fatalf("ListMessages with stale Parquet schema: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2 messages, got %d", len(results))
+		}
+	})
+
+	t.Run("SearchFast", func(t *testing.T) {
+		q := search.Parse("Stale Hello")
+		results, err := engine.SearchFast(ctx, q, MessageFilter{}, 100, 0)
+		if err != nil {
+			t.Fatalf("SearchFast with stale Parquet schema: %v", err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+		if results[0].Subject != "Stale Hello" {
+			t.Fatalf("unexpected subject: %s", results[0].Subject)
+		}
+	})
+
+	t.Run("SearchFastCount", func(t *testing.T) {
+		q := search.Parse("Stale")
+		count, err := engine.SearchFastCount(ctx, q, MessageFilter{})
+		if err != nil {
+			t.Fatalf("SearchFastCount with stale Parquet schema: %v", err)
+		}
+		if count != 2 {
+			t.Fatalf("expected count 2, got %d", count)
+		}
+	})
+
+	t.Run("Aggregate", func(t *testing.T) {
+		results, err := engine.Aggregate(ctx, ViewSenders, DefaultAggregateOptions())
+		if err != nil {
+			t.Fatalf("Aggregate with stale Parquet schema: %v", err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("expected 1 sender, got %d", len(results))
+		}
+	})
+
+	t.Run("GetTotalStats", func(t *testing.T) {
+		stats, err := engine.GetTotalStats(ctx, StatsOptions{})
+		if err != nil {
+			t.Fatalf("GetTotalStats with stale Parquet schema: %v", err)
+		}
+		if stats.MessageCount != 2 {
+			t.Fatalf("expected 2 messages, got %d", stats.MessageCount)
+		}
+	})
+
+	// Verify that optionalCols correctly detected the missing columns.
+	t.Run("ProbeDetectedMissing", func(t *testing.T) {
+		for _, col := range []struct{ table, col string }{
+			{"participants", "phone_number"},
+			{"messages", "attachment_count"},
+			{"messages", "sender_id"},
+			{"messages", "message_type"},
+			{"conversations", "title"},
+		} {
+			if engine.hasCol(col.table, col.col) {
+				t.Errorf("expected %s.%s to be detected as missing", col.table, col.col)
+			}
+		}
+	})
 }

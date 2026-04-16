@@ -54,10 +54,37 @@ Examples:
   # Manual fallback: import a single directory with explicit identifier
   msgvault import-emlx ~/Library/Mail/V10/SOME-GUID --identifier me@gmail.com
   msgvault import-emlx ~/Mail/INBOX.mbox/ --identifier me@gmail.com
+
+  # Legacy two-arg form (deprecated, still works)
+  msgvault import-emlx me@gmail.com ~/Library/Mail/V10/SOME-GUID
 `,
-	Args:         cobra.MaximumNArgs(1),
+	Args:         cobra.MaximumNArgs(2),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Use a local copy so we don't mutate the package-global
+		// flag variable (which persists across Execute() calls).
+		identifier := importEmlxIdentifier
+
+		// Legacy two-arg form: import-emlx <identifier> <mail-dir>
+		if len(args) == 2 {
+			if identifier != "" {
+				return fmt.Errorf(
+					"cannot use --identifier with two positional arguments",
+				)
+			}
+			identifier = args[0]
+			args = args[1:]
+		}
+
+		// --identifier requires an explicit mail-dir to avoid
+		// accidentally importing the entire ~/Library/Mail tree
+		// under one identifier.
+		if identifier != "" && len(args) == 0 {
+			return fmt.Errorf(
+				"--identifier requires a positional mail-dir argument",
+			)
+		}
+
 		// Determine mail directory.
 		var mailDir string
 		if len(args) > 0 {
@@ -106,14 +133,14 @@ Examples:
 					}
 					signals++
 					if signals == 1 {
-						fmt.Fprintln(
+						_, _ = fmt.Fprintln(
 							cmd.ErrOrStderr(),
 							"\nInterrupted. Saving checkpoint...",
 						)
 						cancel()
 						continue
 					}
-					fmt.Fprintln(
+					_, _ = fmt.Fprintln(
 						cmd.ErrOrStderr(),
 						"Interrupted again. Exiting immediately.",
 					)
@@ -127,7 +154,7 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
-		defer st.Close()
+		defer func() { _ = st.Close() }()
 
 		if err := st.InitSchema(); err != nil {
 			return fmt.Errorf("init schema: %w", err)
@@ -138,13 +165,17 @@ Examples:
 			attachmentsDir = ""
 		}
 
-		if importEmlxIdentifier != "" {
+		var importErr error
+		if identifier != "" {
 			// Manual fallback: single import with explicit identifier.
-			return importSingleAccount(ctx, cmd, st, mailDir, importEmlxIdentifier, attachmentsDir)
+			importErr = importSingleAccount(ctx, cmd, st, mailDir, identifier, attachmentsDir)
+		} else {
+			// Auto mode: discover accounts from V10 layout + Accounts4.sqlite.
+			importErr = importAutoAccounts(ctx, cmd, st, mailDir, attachmentsDir)
 		}
 
-		// Auto mode: discover accounts from V10 layout + Accounts4.sqlite.
-		return importAutoAccounts(ctx, cmd, st, mailDir, attachmentsDir)
+		rebuildCacheAfterWrite(dbPath)
+		return importErr
 	},
 }
 
@@ -229,36 +260,37 @@ func importAutoAccounts(
 		accounts = filtered
 	}
 
-	fmt.Fprintf(out, "Discovered %d account(s):\n", len(accounts))
+	_, _ = fmt.Fprintf(out, "Discovered %d account(s):\n", len(accounts))
 	for _, a := range accounts {
 		if a.Email != "" {
-			fmt.Fprintf(out, "  - %s (%s)\n", a.Email, a.Description)
+			_, _ = fmt.Fprintf(out, "  - %s (%s)\n", a.Email, a.Description)
 		} else {
-			fmt.Fprintf(out, "  - %s\n", a.Description)
+			_, _ = fmt.Fprintf(out, "  - %s\n", a.Description)
 		}
 	}
-	fmt.Fprintln(out)
+	_, _ = fmt.Fprintln(out)
 
 	var grandTotal importer.EmlxImportSummary
 	var importErrors []error
 
 	for _, account := range accounts {
 		if ctx.Err() != nil {
-			fmt.Fprintln(out, "Import interrupted between accounts.")
+			_, _ = fmt.Fprintln(out, "Import interrupted between accounts.")
 			break
 		}
 
 		identifier := account.Identifier()
 		accountDir, err := applemail.V10AccountDir(mailDir, account.GUID)
 		if err != nil {
-			fmt.Fprintf(out, "Skipping %s: %v\n", identifier, err)
+			importErrors = append(importErrors, fmt.Errorf("%s: %w", identifier, err))
+			_, _ = fmt.Fprintf(out, "Skipping %s: %v\n", identifier, err)
 			continue
 		}
 
 		if account.Email != "" {
-			fmt.Fprintf(out, "Importing %s (%s)...\n", account.Email, account.Description)
+			_, _ = fmt.Fprintf(out, "Importing %s (%s)...\n", account.Email, account.Description)
 		} else {
-			fmt.Fprintf(out, "Importing %s...\n", account.Description)
+			_, _ = fmt.Fprintf(out, "Importing %s...\n", account.Description)
 		}
 
 		summary, err := importer.ImportEmlxDir(
@@ -276,8 +308,13 @@ func importAutoAccounts(
 			continue
 		}
 
+		if summary.MailboxesTotal == 0 {
+			_, _ = fmt.Fprintf(out, "Skipping %s: no mailboxes found\n", identifier)
+			continue
+		}
+
 		printImportSummary(cmd, ctx, *summary)
-		fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out)
 
 		// Accumulate totals.
 		grandTotal.MailboxesTotal += summary.MailboxesTotal
@@ -293,13 +330,13 @@ func importAutoAccounts(
 	}
 
 	if len(accounts) > 1 {
-		fmt.Fprintln(out, "=== Grand Total ===")
+		_, _ = fmt.Fprintln(out, "=== Grand Total ===")
 		printImportStats(out, grandTotal)
 	}
 
 	if len(importErrors) > 0 {
 		for _, e := range importErrors {
-			fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", e)
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", e)
 		}
 		return fmt.Errorf("import completed with %d account error(s)", len(importErrors))
 	}
@@ -329,38 +366,38 @@ func printImportSummary(cmd *cobra.Command, ctx context.Context, summary importe
 	out := cmd.OutOrStdout()
 
 	if ctx.Err() != nil {
-		fmt.Fprintln(out, "Import interrupted. Run again to resume.")
+		_, _ = fmt.Fprintln(out, "Import interrupted. Run again to resume.")
 	} else if summary.Errors > 0 {
-		fmt.Fprintln(out, "Import complete (with errors).")
+		_, _ = fmt.Fprintln(out, "Import complete (with errors).")
 	} else {
-		fmt.Fprintln(out, "Import complete.")
+		_, _ = fmt.Fprintln(out, "Import complete.")
 	}
 
 	printImportStats(out, summary)
 }
 
 func printImportStats(out io.Writer, summary importer.EmlxImportSummary) {
-	fmt.Fprintf(out,
+	_, _ = fmt.Fprintf(out,
 		"  Mailboxes:      %d discovered, %d imported\n",
 		summary.MailboxesTotal, summary.MailboxesImported,
 	)
-	fmt.Fprintf(out,
+	_, _ = fmt.Fprintf(out,
 		"  Processed:      %d messages\n",
 		summary.MessagesProcessed,
 	)
-	fmt.Fprintf(out,
+	_, _ = fmt.Fprintf(out,
 		"  Added:          %d messages\n",
 		summary.MessagesAdded,
 	)
-	fmt.Fprintf(out,
+	_, _ = fmt.Fprintf(out,
 		"  Updated:        %d messages\n",
 		summary.MessagesUpdated,
 	)
-	fmt.Fprintf(out,
+	_, _ = fmt.Fprintf(out,
 		"  Skipped (dup):  %d messages\n",
 		summary.MessagesSkipped,
 	)
-	fmt.Fprintf(out,
+	_, _ = fmt.Fprintf(out,
 		"  Errors:         %d\n",
 		summary.Errors,
 	)

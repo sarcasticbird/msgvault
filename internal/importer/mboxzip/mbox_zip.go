@@ -55,10 +55,7 @@ func ResolveMboxExport(exportPath string, importsDir string, log *slog.Logger) (
 	}
 
 	ext := strings.ToLower(filepath.Ext(abs))
-	switch ext {
-	case ".mbox", ".mbx":
-		return []string{abs}, nil
-	case ".zip":
+	if ext == ".zip" {
 		// Use a cheap cache key derived from zip entry metadata (central directory)
 		// plus basic zip file metadata. This avoids hashing multi-GB zip files, but
 		// is not a cryptographic integrity check.
@@ -100,9 +97,11 @@ func ResolveMboxExport(exportPath string, importsDir string, log *slog.Logger) (
 			return nil, fmt.Errorf("extract dir %q escapes imports dir %q", destDir, importsAbs)
 		}
 		return ExtractMboxFromZip(abs, destDir, log)
-	default:
-		return nil, fmt.Errorf("unsupported export format %q (expected .mbox/.mbx or .zip)", ext)
 	}
+
+	// Any non-zip file is treated as mbox. Invalid files fail at parse
+	// time when no "From " separators are found.
+	return []string{abs}, nil
 }
 
 func zipMboxCacheKey(zipPath string) (string, error) {
@@ -115,7 +114,7 @@ func zipMboxCacheKey(zipPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("open zip: %w", err)
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 
 	type zipEntry struct {
 		Name string
@@ -151,9 +150,9 @@ func zipMboxCacheKey(zipPath string) (string, error) {
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 
 	h := sha256.New()
-	fmt.Fprintf(h, "zip:%x\n", st.Size())
+	_, _ = fmt.Fprintf(h, "zip:%x\n", st.Size())
 	for _, e := range entries {
-		fmt.Fprintf(h, "%s\x00%x\x00%x\n", e.Name, e.Size, e.CRC)
+		_, _ = fmt.Fprintf(h, "%s\x00%x\x00%x\n", e.Name, e.Size, e.CRC)
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 	return "z" + sum[:16], nil
@@ -215,7 +214,7 @@ func ExtractMboxFromZipWithLimits(zipPath, destDir string, limits ExtractLimits,
 	if err != nil {
 		return nil, fmt.Errorf("open zip: %w", err)
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 
 	var outFiles []string
 	seenNames := make(map[string]struct{})
@@ -259,7 +258,7 @@ func ExtractMboxFromZipWithLimits(zipPath, destDir string, limits ExtractLimits,
 
 		w, err := fileutil.SecureOpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
 		if err != nil {
-			rc.Close()
+			_ = rc.Close()
 			return nil, fmt.Errorf("create extracted file: %w", err)
 		}
 
@@ -494,7 +493,7 @@ func crc32File(path string) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	h := crc32.NewIEEE()
 	if _, err := io.Copy(h, f); err != nil {
@@ -508,7 +507,7 @@ func expectedMboxFilesFromZip(zipPath, destDir string, limits ExtractLimits) ([]
 	if err != nil {
 		return nil, fmt.Errorf("open zip: %w", err)
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 
 	var expected []expectedMboxFile
 	seenNames := make(map[string]struct{})

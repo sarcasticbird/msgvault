@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wesm/msgvault/internal/search"
 )
@@ -184,6 +185,10 @@ func optsToFilterConditions(opts AggregateOptions, prefix string) ([]string, []i
 	var conditions []string
 	var args []interface{}
 
+	// Exclude text messages from email-mode queries.
+	// message_type IS NULL and '' handle old data without the column.
+	conditions = append(conditions, "("+prefix+"message_type = 'email' OR "+prefix+"message_type IS NULL OR "+prefix+"message_type = '')")
+
 	if opts.SourceID != nil {
 		conditions = append(conditions, prefix+"source_id = ?")
 		args = append(args, *opts.SourceID)
@@ -252,6 +257,10 @@ func buildFilterJoinsAndConditions(filter MessageFilter, tableAlias string) (str
 
 	// Include all messages (deleted messages shown with indicator in TUI)
 
+	// Exclude text messages from email-mode queries.
+	// message_type IS NULL and '' handle old data without the column.
+	conditions = append(conditions, "("+prefix+"message_type = 'email' OR "+prefix+"message_type IS NULL OR "+prefix+"message_type = '')")
+
 	if filter.SourceID != nil {
 		conditions = append(conditions, prefix+"source_id = ?")
 		args = append(args, *filter.SourceID)
@@ -279,40 +288,56 @@ func buildFilterJoinsAndConditions(filter MessageFilter, tableAlias string) (str
 		conditions = append(conditions, prefix+"deleted_from_source_at IS NULL")
 	}
 
-	// Sender filter
+	// Sender filter - check both message_recipients (email) and direct sender_id (WhatsApp/chat)
+	// Also checks phone_number for phone-based lookups (e.g., from:+447...)
 	if filter.Sender != "" {
-		joins = append(joins, `
-			JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
-			JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
-		`)
-		conditions = append(conditions, "p_filter_from.email_address = ?")
-		args = append(args, filter.Sender)
-	} else if filter.MatchesEmpty(ViewSenders) {
 		joins = append(joins, `
 			LEFT JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
 			LEFT JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+			LEFT JOIN participants p_direct_sender ON p_direct_sender.id = m.sender_id
 		`)
-		conditions = append(conditions, "(mr_filter_from.id IS NULL OR p_filter_from.email_address IS NULL OR p_filter_from.email_address = '')")
+		conditions = append(conditions, "(p_filter_from.email_address = ? OR p_filter_from.phone_number = ? OR p_direct_sender.email_address = ? OR p_direct_sender.phone_number = ?)")
+		args = append(args, filter.Sender, filter.Sender, filter.Sender, filter.Sender)
+	} else if filter.MatchesEmpty(ViewSenders) {
+		// A message has an "empty sender" only if it has no from-recipient AND no direct sender_id.
+		joins = append(joins, `
+			LEFT JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
+			LEFT JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+			LEFT JOIN participants p_direct_sender ON p_direct_sender.id = m.sender_id
+		`)
+		conditions = append(conditions, `((mr_filter_from.id IS NULL OR (
+			(p_filter_from.email_address IS NULL OR p_filter_from.email_address = '') AND
+			(p_filter_from.phone_number IS NULL OR p_filter_from.phone_number = '')
+		)) AND m.sender_id IS NULL)`)
 	}
 
-	// Sender name filter
+	// Sender name filter - check both message_recipients (email) and direct sender_id (WhatsApp/chat)
 	if filter.SenderName != "" {
 		if filter.Sender == "" && !filter.MatchesEmpty(ViewSenders) {
 			joins = append(joins, `
-				JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
-				JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+				LEFT JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
+				LEFT JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+				LEFT JOIN participants p_direct_sender ON p_direct_sender.id = m.sender_id
 			`)
 		}
-		conditions = append(conditions, "COALESCE(NULLIF(TRIM(p_filter_from.display_name), ''), p_filter_from.email_address) = ?")
-		args = append(args, filter.SenderName)
+		conditions = append(conditions, `(
+			COALESCE(NULLIF(TRIM(p_filter_from.display_name), ''), p_filter_from.email_address) = ?
+			OR COALESCE(NULLIF(TRIM(p_direct_sender.display_name), ''), p_direct_sender.email_address) = ?
+		)`)
+		args = append(args, filter.SenderName, filter.SenderName)
 	} else if filter.MatchesEmpty(ViewSenderNames) {
-		conditions = append(conditions, `NOT EXISTS (
+		// A message has an "empty sender name" only if it has no from-recipient name AND no direct sender_id with a name.
+		conditions = append(conditions, `(NOT EXISTS (
 			SELECT 1 FROM message_recipients mr_sn
 			JOIN participants p_sn ON p_sn.id = mr_sn.participant_id
 			WHERE mr_sn.message_id = m.id
 			  AND mr_sn.recipient_type = 'from'
 			  AND COALESCE(NULLIF(TRIM(p_sn.display_name), ''), p_sn.email_address) IS NOT NULL
-		)`)
+		) AND NOT EXISTS (
+			SELECT 1 FROM participants p_ds
+			WHERE p_ds.id = m.sender_id
+			  AND COALESCE(NULLIF(TRIM(p_ds.display_name), ''), p_ds.email_address) IS NOT NULL
+		))`)
 	}
 
 	// Recipient filter
@@ -539,7 +564,7 @@ func (e *SQLiteEngine) executeAggregateQuery(ctx context.Context, query string, 
 	if err != nil {
 		return nil, fmt.Errorf("aggregate query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []AggregateRow
 	for rows.Next() {
@@ -599,14 +624,17 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 			COALESCE(m.snippet, ''),
 			COALESCE(p_sender.email_address, ''),
 			COALESCE(p_sender.display_name, ''),
+			COALESCE(p_sender.phone_number, ''),
 			m.sent_at,
 			COALESCE(m.size_estimate, 0),
 			m.has_attachments,
 			m.attachment_count,
-			m.deleted_from_source_at
+			m.deleted_from_source_at,
+			COALESCE(m.message_type, ''),
+			COALESCE(conv.title, '')
 		FROM messages m
 		LEFT JOIN message_recipients mr_sender ON mr_sender.message_id = m.id AND mr_sender.recipient_type = 'from'
-		LEFT JOIN participants p_sender ON p_sender.id = mr_sender.participant_id
+		LEFT JOIN participants p_sender ON p_sender.id = COALESCE(mr_sender.participant_id, m.sender_id)
 		LEFT JOIN conversations conv ON conv.id = m.conversation_id
 		%s
 		WHERE %s
@@ -620,7 +648,7 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 	if err != nil {
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []MessageSummary
 	for rows.Next() {
@@ -636,11 +664,14 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 			&msg.Snippet,
 			&msg.FromEmail,
 			&msg.FromName,
+			&msg.FromPhone,
 			&sentAt,
 			&msg.SizeEstimate,
 			&msg.HasAttachments,
 			&msg.AttachmentCount,
 			&deletedAt,
+			&msg.MessageType,
+			&msg.ConversationTitle,
 		); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
@@ -717,7 +748,7 @@ func (e *SQLiteEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) 
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var accounts []AccountInfo
 	for rows.Next() {
@@ -749,6 +780,8 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	// the messages table for compatibility with search joins.
 	var conditions []string
 	var args []interface{}
+	// Restrict to email messages only; NULL and '' handle pre-message_type data.
+	conditions = append(conditions, emailOnlyFilterM)
 	// Include all messages (deleted messages shown with indicator in TUI)
 	if opts.SourceID != nil {
 		conditions = append(conditions, "m.source_id = ?")
@@ -878,24 +911,33 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 	// Build JOIN clauses based on filter type
 	var joins []string
 
+	// Scope to Gmail sources only — this function is used for Gmail-specific
+	// deletion/staging workflows and must not return WhatsApp or other source IDs.
+	joins = append(joins, `JOIN sources s_gmail ON s_gmail.id = m.source_id AND s_gmail.source_type = 'gmail'`)
+
 	if filter.Sender != "" {
 		joins = append(joins, `
-			JOIN message_recipients mr_from ON mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
-			JOIN participants p_from ON p_from.id = mr_from.participant_id
+			LEFT JOIN message_recipients mr_from ON mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
+			LEFT JOIN participants p_from ON p_from.id = mr_from.participant_id
+			LEFT JOIN participants p_ds ON p_ds.id = m.sender_id
 		`)
-		conditions = append(conditions, "p_from.email_address = ?")
-		args = append(args, filter.Sender)
+		conditions = append(conditions, "(p_from.email_address = ? OR p_from.phone_number = ? OR p_ds.email_address = ? OR p_ds.phone_number = ?)")
+		args = append(args, filter.Sender, filter.Sender, filter.Sender, filter.Sender)
 	}
 
 	if filter.SenderName != "" {
 		if filter.Sender == "" {
 			joins = append(joins, `
-				JOIN message_recipients mr_from ON mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
-				JOIN participants p_from ON p_from.id = mr_from.participant_id
+				LEFT JOIN message_recipients mr_from ON mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
+				LEFT JOIN participants p_from ON p_from.id = mr_from.participant_id
+				LEFT JOIN participants p_ds ON p_ds.id = m.sender_id
 			`)
 		}
-		conditions = append(conditions, "COALESCE(NULLIF(TRIM(p_from.display_name), ''), p_from.email_address) = ?")
-		args = append(args, filter.SenderName)
+		conditions = append(conditions, `(
+			COALESCE(NULLIF(TRIM(p_from.display_name), ''), p_from.email_address) = ?
+			OR COALESCE(NULLIF(TRIM(p_ds.display_name), ''), p_ds.email_address) = ?
+		)`)
+		args = append(args, filter.SenderName, filter.SenderName)
 	}
 
 	if filter.Recipient != "" {
@@ -987,7 +1029,7 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 	if err != nil {
 		return nil, fmt.Errorf("get gmail ids: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	return collectGmailIDs(rows)
 }
@@ -996,7 +1038,8 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 // buildSearchQueryParts builds the WHERE conditions, args, joins, and FTS join
 // for a search query. This is shared between Search and SearchFastCount.
 func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Query) (conditions []string, args []interface{}, joins []string, ftsJoin string) {
-	// Include all messages (deleted messages shown with indicator in TUI)
+	// Restrict to email messages only; NULL and '' handle pre-message_type data.
+	conditions = append(conditions, emailOnlyFilterM)
 
 	// From filter - uses EXISTS to avoid join multiplication in aggregates.
 	// Handles both exact addresses and @domain patterns.
@@ -1118,17 +1161,17 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 	// Full-text search: use FTS5 if available, fall back to LIKE
 	if len(q.TextTerms) > 0 {
 		if e.hasFTSTable(ctx) {
-			// Use FTS5 for efficient full-text search
+			// Use FTS5 for efficient full-text search.
+			// Prefix matching (*) enables partial word matches.
+			// Multiple terms are AND-ed: all must appear (in any column).
 			ftsJoin = "JOIN messages_fts fts ON fts.rowid = m.id"
-			// Build FTS match expression. Every term is double-quoted so
-			// FTS5 treats it as a tokenized phrase instead of parsing for
-			// query operators (e.g. "-" as NOT, ":" as column filter).
-			// Without quoting, "Re-Enrollment" is parsed as Re NOT
-			// Enrollment, which errors with "no such column: Enrollment".
 			ftsTerms := make([]string, len(q.TextTerms))
 			for i, term := range q.TextTerms {
+				// Quote all terms to prevent FTS5 special chars
+				// (-, :, (, ), etc.) from being parsed as query syntax.
 				term = strings.ReplaceAll(term, "\"", "\"\"")
-				ftsTerms[i] = fmt.Sprintf("\"%s\"", term)
+				term = strings.ReplaceAll(term, "*", "")
+				ftsTerms[i] = fmt.Sprintf("\"%s\"*", term)
 			}
 			conditions = append(conditions, "messages_fts MATCH ?")
 			args = append(args, strings.Join(ftsTerms, " "))
@@ -1192,14 +1235,17 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 			COALESCE(m.snippet, ''),
 			COALESCE(p_sender.email_address, ''),
 			COALESCE(p_sender.display_name, ''),
+			COALESCE(p_sender.phone_number, ''),
 			m.sent_at,
 			COALESCE(m.size_estimate, 0),
 			m.has_attachments,
 			m.attachment_count,
-			m.deleted_from_source_at
+			m.deleted_from_source_at,
+			COALESCE(m.message_type, ''),
+			COALESCE(conv.title, '')
 		FROM messages m
 		LEFT JOIN message_recipients mr_sender ON mr_sender.message_id = m.id AND mr_sender.recipient_type = 'from'
-		LEFT JOIN participants p_sender ON p_sender.id = mr_sender.participant_id
+		LEFT JOIN participants p_sender ON p_sender.id = COALESCE(mr_sender.participant_id, m.sender_id)
 		LEFT JOIN conversations conv ON conv.id = m.conversation_id
 		%s
 		%s
@@ -1214,7 +1260,7 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 	if err != nil {
 		return nil, fmt.Errorf("search messages: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []MessageSummary
 	for rows.Next() {
@@ -1230,11 +1276,14 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 			&msg.Snippet,
 			&msg.FromEmail,
 			&msg.FromName,
+			&msg.FromPhone,
 			&sentAt,
 			&msg.SizeEstimate,
 			&msg.HasAttachments,
 			&msg.AttachmentCount,
 			&deletedAt,
+			&msg.MessageType,
+			&msg.ConversationTitle,
 		); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
@@ -1318,7 +1367,71 @@ func MergeFilterIntoQuery(q *search.Query, filter MessageFilter) *search.Query {
 		merged.HideDeleted = true
 	}
 
+	// Date range filters — intersect (take the stricter bound) so
+	// a user-supplied after:/before: cannot widen beyond the current
+	// drill-down context.
+	if filter.After != nil {
+		if merged.AfterDate == nil || filter.After.After(*merged.AfterDate) {
+			merged.AfterDate = filter.After
+		}
+	}
+	if filter.Before != nil {
+		if merged.BeforeDate == nil || filter.Before.Before(*merged.BeforeDate) {
+			merged.BeforeDate = filter.Before
+		}
+	}
+
+	// TimeRange.Period can be converted to date bounds. A period
+	// like "2024" → [2024-01-01, 2025-01-01), "2024-03" →
+	// [2024-03-01, 2024-04-01), "2024-03-15" → [2024-03-15, 2024-03-16).
+	if filter.TimeRange.Period != "" {
+		if after, before, ok := timePeriodToBounds(
+			filter.TimeRange.Period,
+		); ok {
+			if merged.AfterDate == nil ||
+				after.After(*merged.AfterDate) {
+				merged.AfterDate = &after
+			}
+			if merged.BeforeDate == nil ||
+				before.Before(*merged.BeforeDate) {
+				merged.BeforeDate = &before
+			}
+		}
+	}
+
+	// Note: SenderName, RecipientName, ConversationID, and
+	// EmptyValueTargets cannot be represented in search.Query
+	// and are not merged. Deep search within those drill-down
+	// contexts will not be scoped to the current view.
+
 	return &merged
+}
+
+// timePeriodToBounds converts a time period string to half-open date
+// bounds [after, before). Returns ok=false if the format is unrecognized.
+func timePeriodToBounds(period string) (after, before time.Time, ok bool) {
+	switch len(period) {
+	case 4: // "2024" → year
+		t, err := time.Parse("2006", period)
+		if err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+		return t, t.AddDate(1, 0, 0), true
+	case 7: // "2024-03" → month
+		t, err := time.Parse("2006-01", period)
+		if err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+		return t, t.AddDate(0, 1, 0), true
+	case 10: // "2024-03-15" → day
+		t, err := time.Parse("2006-01-02", period)
+		if err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+		return t, t.AddDate(0, 0, 1), true
+	default:
+		return time.Time{}, time.Time{}, false
+	}
 }
 
 // SearchFastCount returns the total count of messages matching a search query.

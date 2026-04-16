@@ -40,7 +40,11 @@ func runExportAttachments(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
+
+	if err := s.InitSchema(); err != nil {
+		return fmt.Errorf("init schema: %w", err)
+	}
 
 	engine := query.NewSQLiteEngine(s.DB())
 
@@ -87,6 +91,12 @@ func runExportAttachments(cmd *cobra.Command, args []string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("not a directory: %s", outputDir)
 	}
+	tmpFile, err := os.CreateTemp(outputDir, ".msgvault_write_test-*")
+	if err != nil {
+		return fmt.Errorf("output directory not writable: %w", err)
+	}
+	_ = tmpFile.Close()
+	_ = os.Remove(tmpFile.Name())
 
 	// Export
 	attachmentsDir := cfg.AttachmentsDir()
@@ -110,7 +120,7 @@ func runExportAttachments(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(result.Errors) > 0 && len(result.Files) == 0 {
-		return fmt.Errorf("all %d attachment(s) failed to export", len(msg.Attachments))
+		return fmt.Errorf("all %d attachment(s) failed to export", len(result.Errors))
 	}
 	if len(result.Errors) > 0 {
 		return fmt.Errorf("%d of %d attachment(s) failed to export",
