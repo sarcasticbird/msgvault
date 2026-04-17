@@ -1218,12 +1218,16 @@ func (e *DuckDBEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) 
 	var accounts []AccountInfo
 	for rows.Next() {
 		var acc AccountInfo
-		var lastSync sql.NullTime
+		var lastSync sql.NullString
 		if err := rows.Scan(&acc.ID, &acc.SourceType, &acc.Identifier, &acc.DisplayName, &lastSync); err != nil {
 			return nil, fmt.Errorf("scan account: %w", err)
 		}
 		if lastSync.Valid {
-			acc.LastSyncWithData = &lastSync.Time
+			if t, err := time.Parse("2006-01-02 15:04:05", lastSync.String); err == nil {
+				acc.LastSyncWithData = &t
+			} else if t, err := time.Parse(time.RFC3339, lastSync.String); err == nil {
+				acc.LastSyncWithData = &t
+			}
 		}
 		accounts = append(accounts, acc)
 	}
