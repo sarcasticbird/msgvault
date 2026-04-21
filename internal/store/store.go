@@ -2,6 +2,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"errors"
@@ -179,6 +180,42 @@ func (s *Store) CheckpointWAL() error {
 // at a different abstraction layer.
 func (s *Store) DB() *sql.DB {
 	return s.db.DB
+}
+
+// WithExclusiveLock executes fn while holding an exclusive write lock on the
+// database. In WAL mode this blocks concurrent writers (e.g. StartSync) while
+// allowing reads (e.g. IsAttachmentPathReferenced) to proceed. Use this to
+// serialize destructive file operations against concurrent sync attachment
+// ingestion. The context controls both lock acquisition and the lifetime of
+// the underlying connection; cancelling it aborts a pending BEGIN EXCLUSIVE
+// and rolls back any held transaction.
+func (s *Store) WithExclusiveLock(ctx context.Context, fn func() error) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		return fmt.Errorf("begin exclusive: %w", err)
+	}
+
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	if err := fn(); err != nil {
+		return err
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit exclusive: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // withTx executes fn within a database transaction. If fn returns an error,
