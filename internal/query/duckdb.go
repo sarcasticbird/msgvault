@@ -1203,9 +1203,12 @@ func (e *DuckDBEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) 
 	}
 
 	rows, err := e.db.QueryContext(ctx, `
-		SELECT id, source_type, identifier, COALESCE(display_name, '')
-		FROM sqlite_db.sources
-		ORDER BY identifier
+		SELECT s.id, s.source_type, s.identifier, COALESCE(s.display_name, ''),
+		       (SELECT MAX(sr.completed_at) FROM sqlite_db.sync_runs sr
+		        WHERE sr.source_id = s.id AND sr.status = 'completed'
+		          AND (sr.messages_added > 0 OR sr.messages_updated > 0))
+		FROM sqlite_db.sources s
+		ORDER BY s.identifier
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
@@ -1215,8 +1218,16 @@ func (e *DuckDBEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) 
 	var accounts []AccountInfo
 	for rows.Next() {
 		var acc AccountInfo
-		if err := rows.Scan(&acc.ID, &acc.SourceType, &acc.Identifier, &acc.DisplayName); err != nil {
+		var lastSync sql.NullString
+		if err := rows.Scan(&acc.ID, &acc.SourceType, &acc.Identifier, &acc.DisplayName, &lastSync); err != nil {
 			return nil, fmt.Errorf("scan account: %w", err)
+		}
+		if lastSync.Valid {
+			if t, err := time.Parse("2006-01-02 15:04:05", lastSync.String); err == nil {
+				acc.LastSyncWithData = &t
+			} else if t, err := time.Parse(time.RFC3339, lastSync.String); err == nil {
+				acc.LastSyncWithData = &t
+			}
 		}
 		accounts = append(accounts, acc)
 	}
@@ -2047,12 +2058,28 @@ func (e *DuckDBEngine) dropSearchCache() {
 
 // searchPageFromCache executes Phase 3 (paginated results) from the cached temp table.
 // Returns a SearchFastResult with cached count and stats.
-func (e *DuckDBEngine) searchPageFromCache(ctx context.Context, limit, offset int) (*SearchFastResult, error) {
+func (e *DuckDBEngine) searchPageFromCache(ctx context.Context, sorting MessageSorting, limit, offset int) (*SearchFastResult, error) {
+	// Build ORDER BY clause from sorting parameters.
+	var orderCol string
+	switch sorting.Field {
+	case MessageSortBySize:
+		orderCol = "sm.size_estimate"
+	case MessageSortBySubject:
+		orderCol = "sm.subject"
+	default:
+		orderCol = "sm.sent_at"
+	}
+	orderDir := "DESC"
+	if sorting.Direction == SortAsc {
+		orderDir = "ASC"
+	}
+	orderBy := orderCol + " " + orderDir
+
 	pageQuery := fmt.Sprintf(`
 		WITH %s,
 		page AS (
 			SELECT sm.id FROM %s sm
-			ORDER BY sm.sent_at DESC
+			ORDER BY %s
 			LIMIT ? OFFSET ?
 		),
 		msg_labels AS (
@@ -2085,8 +2112,8 @@ func (e *DuckDBEngine) searchPageFromCache(ctx context.Context, limit, offset in
 		LEFT JOIN att ON att.message_id = sm.id
 		LEFT JOIN msg_labels mlbl ON mlbl.message_id = sm.id
 		LEFT JOIN conv c ON c.id = sm.conversation_id
-		ORDER BY sm.sent_at DESC
-	`, e.parquetCTEs(), e.searchCacheTable, e.searchCacheTable)
+		ORDER BY %s
+	`, e.parquetCTEs(), e.searchCacheTable, orderBy, e.searchCacheTable, orderBy)
 
 	rows, err := e.db.QueryContext(ctx, pageQuery, limit, offset)
 	if err != nil {
@@ -2225,7 +2252,7 @@ func (e *DuckDBEngine) SearchFastWithStats(ctx context.Context, q *search.Query,
 		if e.searchCacheStats == nil {
 			e.searchCacheStats = e.computeSearchStats(ctx)
 		}
-		return e.searchPageFromCache(ctx, limit, offset)
+		return e.searchPageFromCache(ctx, filter.Sorting, limit, offset)
 	}
 
 	// Cache miss — drop old cache and materialize fresh.
@@ -2305,7 +2332,7 @@ func (e *DuckDBEngine) SearchFastWithStats(ctx context.Context, q *search.Query,
 	e.searchCacheKey = cacheKey
 
 	// Phase 3: Paginated results from cached temp table.
-	return e.searchPageFromCache(ctx, limit, offset)
+	return e.searchPageFromCache(ctx, filter.Sorting, limit, offset)
 }
 
 // buildSearchConditions builds WHERE conditions for search queries.

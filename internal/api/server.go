@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -14,12 +15,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/wesm/msgvault/internal/config"
+	"github.com/wesm/msgvault/internal/deletion"
 	"github.com/wesm/msgvault/internal/query"
 	"github.com/wesm/msgvault/internal/scheduler"
 	"github.com/wesm/msgvault/internal/search"
 	"github.com/wesm/msgvault/internal/store"
 	"github.com/wesm/msgvault/internal/vector"
 	"github.com/wesm/msgvault/internal/vector/hybrid"
+	"github.com/wesm/msgvault/internal/web"
 )
 
 // MessageStore defines the store operations the API needs.
@@ -51,7 +54,7 @@ type AccountStatus = scheduler.AccountStatus
 type Server struct {
 	cfg            *config.Config
 	store          MessageStore
-	engine         query.Engine // Query engine for aggregates and TUI support
+	engine         query.Engine // Query engine for aggregates, TUI, and web UI support
 	hybridEngine   *hybrid.Engine
 	vectorCfg      vector.Config
 	backend        vector.Backend
@@ -68,7 +71,7 @@ type Server struct {
 type ServerOptions struct {
 	Config       *config.Config
 	Store        MessageStore
-	Engine       query.Engine // Optional: query engine for aggregates and TUI support
+	Engine       query.Engine // Optional: query engine for aggregates, TUI, and web UI support
 	HybridEngine *hybrid.Engine
 	VectorCfg    vector.Config
 	Backend      vector.Backend
@@ -188,6 +191,23 @@ func (s *Server) setupRouter() chi.Router {
 		// Token upload for headless OAuth
 		r.Post("/auth/token/{email}", s.handleUploadToken)
 	})
+
+	// Web UI (enabled when query engine is provided)
+	if s.engine != nil {
+		var delMgr *deletion.Manager
+		deletionsDir := filepath.Join(s.cfg.Data.DataDir, "deletions")
+		mgr, err := deletion.NewManager(deletionsDir)
+		if err != nil {
+			s.logger.Error("failed to create deletion manager", "error", err)
+		} else {
+			delMgr = mgr
+		}
+		webHandler := web.NewHandler(s.engine, delMgr, s.cfg.AttachmentsDir())
+		r.Group(func(r chi.Router) {
+			r.Use(s.authMiddleware)
+			r.Mount("/", webHandler.Routes())
+		})
+	}
 
 	return r
 }

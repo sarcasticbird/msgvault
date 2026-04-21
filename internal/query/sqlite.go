@@ -840,9 +840,12 @@ func (e *SQLiteEngine) GetAttachment(ctx context.Context, id int64) (*Attachment
 // ListAccounts returns all source accounts.
 func (e *SQLiteEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) {
 	rows, err := e.db.QueryContext(ctx, `
-		SELECT id, source_type, identifier, COALESCE(display_name, '')
-		FROM sources
-		ORDER BY identifier
+		SELECT s.id, s.source_type, s.identifier, COALESCE(s.display_name, ''),
+		       (SELECT MAX(sr.completed_at) FROM sync_runs sr
+		        WHERE sr.source_id = s.id AND sr.status = 'completed'
+		          AND (sr.messages_added > 0 OR sr.messages_updated > 0))
+		FROM sources s
+		ORDER BY s.identifier
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
@@ -852,8 +855,16 @@ func (e *SQLiteEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) 
 	var accounts []AccountInfo
 	for rows.Next() {
 		var acc AccountInfo
-		if err := rows.Scan(&acc.ID, &acc.SourceType, &acc.Identifier, &acc.DisplayName); err != nil {
+		var lastSync sql.NullString
+		if err := rows.Scan(&acc.ID, &acc.SourceType, &acc.Identifier, &acc.DisplayName, &lastSync); err != nil {
 			return nil, fmt.Errorf("scan account: %w", err)
+		}
+		if lastSync.Valid {
+			if t, err := time.Parse("2006-01-02 15:04:05", lastSync.String); err == nil {
+				acc.LastSyncWithData = &t
+			} else if t, err := time.Parse(time.RFC3339, lastSync.String); err == nil {
+				acc.LastSyncWithData = &t
+			}
 		}
 		accounts = append(accounts, acc)
 	}

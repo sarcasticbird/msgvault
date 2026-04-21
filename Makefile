@@ -17,15 +17,19 @@ LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 # - sqlite_vec: enable the sqlite-vec extension for vector search
 BUILD_TAGS := fts5 sqlite_vec
 
-.PHONY: build build-release install clean test test-v fmt lint lint-ci tidy shootout run-shootout install-hooks bench help
+.PHONY: build build-release install clean test test-v fmt lint lint-ci tidy generate shootout run-shootout install-hooks bench help
+
+# Generate templ templates
+generate:
+	templ generate
 
 # Build the binary (debug)
-build:
+build: generate
 	CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o msgvault ./cmd/msgvault
 	@chmod +x msgvault
 
 # Build with optimizations (release)
-build-release:
+build-release: generate
 	CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS_RELEASE)" -trimpath -o msgvault ./cmd/msgvault
 	@chmod +x msgvault
 
@@ -113,7 +117,8 @@ run-shootout: shootout
 help:
 	@echo "msgvault build targets:"
 	@echo ""
-	@echo "  build          - Debug build"
+	@echo "  generate       - Generate templ templates"
+	@echo "  build          - Debug build (includes generate)"
 	@echo "  build-release  - Release build (optimized, stripped)"
 	@echo "  install        - Install to ~/.local/bin or GOPATH"
 	@echo ""
