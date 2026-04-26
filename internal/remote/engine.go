@@ -575,6 +575,11 @@ func (e *Engine) GetAttachment(ctx context.Context, id int64) (*query.Attachment
 	return nil, ErrNotSupported
 }
 
+// GetMessageRaw returns the decompressed raw MIME data for a message.
+func (e *Engine) GetMessageRaw(ctx context.Context, id int64) ([]byte, error) {
+	return nil, ErrNotSupported
+}
+
 // Search performs full-text search including message body.
 func (e *Engine) Search(ctx context.Context, q *search.Query, limit, offset int) ([]query.MessageSummary, error) {
 	// Build query string from search.Query
