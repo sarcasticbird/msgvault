@@ -133,12 +133,13 @@ templ messageHeader(msg *query.MessageDetail) {
 
 templ messageBody(msg *query.MessageDetail) {
 	<div class="card">
-		if msg.BodyText != "" {
-			<pre class="msg-body">{ msg.BodyText }</pre>
-		} else if msg.BodyHTML != "" {
-			<pre class="msg-body">{ htmlToPlainText(msg.BodyHTML) }</pre>
-		} else {
-			<p style="color: var(--fg-muted); font-style: italic;">(No message content)</p>
-		}
+		<iframe
+			sandbox="allow-same-origin allow-scripts"
+			src={ fmt.Sprintf("/messages/%d/html", msg.ID) }
+			class="msg-body-frame"
+			frameborder="0"
+			scrolling="no"
+			style="width: 100%; border: none; min-height: 200px;"
+		></iframe>
 	</div>
 }
