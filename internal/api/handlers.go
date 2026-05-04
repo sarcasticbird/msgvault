@@ -1604,7 +1604,9 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMessageInline serves a CID-referenced inline MIME part (e.g. an
-// embedded image) from the raw message data.
+// embedded image) from the raw message data. The CID is passed as a `cid`
+// query parameter so values containing `/` (legal per RFC 5322) round-trip
+// without ambiguity in the routing layer.
 func (s *Server) handleMessageInline(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
@@ -1618,9 +1620,9 @@ func (s *Server) handleMessageInline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cidParam := chi.URLParam(r, "cid")
+	cidParam := r.URL.Query().Get("cid")
 	if cidParam == "" {
-		writeError(w, http.StatusBadRequest, "missing_cid", "Missing content ID")
+		writeError(w, http.StatusBadRequest, "missing_cid", "Missing 'cid' query parameter")
 		return
 	}
 

@@ -84,6 +84,15 @@ func (e *PostgreSQLEngine) GetMessageBySourceID(ctx context.Context, sourceMessa
 	return nil, ErrNotImplemented
 }
 
+// GetMessageRaw returns the decompressed raw MIME data for a message.
+//
+// Returns ErrNotImplemented: the PostgreSQL store does not yet populate
+// message_raw, so there is nothing to read. Wired up alongside the rest of
+// the message-detail path.
+func (e *PostgreSQLEngine) GetMessageRaw(ctx context.Context, id int64) ([]byte, error) {
+	return nil, ErrNotImplemented
+}
+
 // GetAttachment retrieves attachment metadata by ID.
 func (e *PostgreSQLEngine) GetAttachment(ctx context.Context, id int64) (*AttachmentInfo, error) {
 	var att AttachmentInfo

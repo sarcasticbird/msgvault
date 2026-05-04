@@ -6,8 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -2091,6 +2093,13 @@ func TestHandleStats_VectorEnabledWithActive(t *testing.T) {
 	}
 }
 
+// inlineURL builds the inline endpoint URL for a given message ID and CID,
+// URL-encoding the CID so values with reserved characters (including `/`)
+// round-trip correctly.
+func inlineURL(id int64, cid string) string {
+	return fmt.Sprintf("/api/v1/messages/%d/inline?cid=%s", id, url.QueryEscape(cid))
+}
+
 // rawMIMEWithImagePart returns a multipart MIME message containing a single
 // image part with the given Content-ID, content type, and Content-Disposition
 // (typically "inline" or "attachment").
@@ -2129,7 +2138,7 @@ func TestHandleMessageInline_ImagePNG(t *testing.T) {
 	}
 	srv := newTestServerWithEngine(t, engine)
 
-	req := httptest.NewRequest("GET", "/api/v1/messages/1/inline/logo@example", nil)
+	req := httptest.NewRequest("GET", inlineURL(1, "logo@example"), nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
 
@@ -2165,7 +2174,7 @@ func TestHandleMessageInline_NonInlineSkipped(t *testing.T) {
 	}
 	srv := newTestServerWithEngine(t, engine)
 
-	req := httptest.NewRequest("GET", "/api/v1/messages/1/inline/logo@example", nil)
+	req := httptest.NewRequest("GET", inlineURL(1, "logo@example"), nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
 
@@ -2182,7 +2191,7 @@ func TestHandleMessageInline_RejectsXHTML(t *testing.T) {
 	}
 	srv := newTestServerWithEngine(t, engine)
 
-	req := httptest.NewRequest("GET", "/api/v1/messages/1/inline/evil@nasty", nil)
+	req := httptest.NewRequest("GET", inlineURL(1, "evil@nasty"), nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
 
@@ -2199,7 +2208,7 @@ func TestHandleMessageInline_RejectsSVG(t *testing.T) {
 	}
 	srv := newTestServerWithEngine(t, engine)
 
-	req := httptest.NewRequest("GET", "/api/v1/messages/1/inline/vuln@svg", nil)
+	req := httptest.NewRequest("GET", inlineURL(1, "vuln@svg"), nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
 
@@ -2216,7 +2225,7 @@ func TestHandleMessageInline_CIDNotFound(t *testing.T) {
 	}
 	srv := newTestServerWithEngine(t, engine)
 
-	req := httptest.NewRequest("GET", "/api/v1/messages/1/inline/nonexistent@cid", nil)
+	req := httptest.NewRequest("GET", inlineURL(1, "nonexistent@cid"), nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
 
@@ -2228,7 +2237,7 @@ func TestHandleMessageInline_CIDNotFound(t *testing.T) {
 func TestHandleMessageInline_NoEngine(t *testing.T) {
 	srv, _ := newTestServerWithMockStore(t)
 
-	req := httptest.NewRequest("GET", "/api/v1/messages/1/inline/any@cid", nil)
+	req := httptest.NewRequest("GET", inlineURL(1, "any@cid"), nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
 
@@ -2243,11 +2252,52 @@ func TestHandleMessageInline_MessageNotFound(t *testing.T) {
 	}
 	srv := newTestServerWithEngine(t, engine)
 
-	req := httptest.NewRequest("GET", "/api/v1/messages/999/inline/any@cid", nil)
+	req := httptest.NewRequest("GET", inlineURL(999, "any@cid"), nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+// TestHandleMessageInline_CIDWithSlash verifies that Content-IDs containing
+// `/` round-trip correctly through the query parameter.
+func TestHandleMessageInline_CIDWithSlash(t *testing.T) {
+	cid := "path/with/slashes@example.com"
+	imgData := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	raw := rawMIMEWithInlineImage(cid, "image/png", imgData)
+
+	engine := &querytest.MockEngine{
+		RawMessages: map[int64][]byte{1: raw},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", inlineURL(1, cid), nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if !bytes.Equal(w.Body.Bytes(), imgData) {
+		t.Errorf("response body = %x, want %x", w.Body.Bytes(), imgData)
+	}
+}
+
+// TestHandleMessageInline_MissingCID verifies that a request without the
+// `cid` query parameter returns 400.
+func TestHandleMessageInline_MissingCID(t *testing.T) {
+	engine := &querytest.MockEngine{
+		RawMessages: map[int64][]byte{1: rawMIMEWithInlineImage("logo@example", "image/png", []byte{0x89})},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/1/inline", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d for missing cid", w.Code, http.StatusBadRequest)
 	}
 }
