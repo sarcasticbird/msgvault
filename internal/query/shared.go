@@ -184,14 +184,19 @@ func extractBodyFromRawShared(ctx context.Context, db *sql.DB, tablePrefix strin
 }
 
 // getMessageRawShared retrieves and decompresses raw MIME data for a message.
-// Returns nil, nil if no raw data is stored.
+// Returns nil, nil if no raw data is stored, or if the message has been
+// deleted from source — the listing/search endpoints hide deleted-from-source
+// messages, so the raw-MIME path stays aligned and refuses to serve them.
 func getMessageRawShared(ctx context.Context, db *sql.DB, tablePrefix string, messageID int64) ([]byte, error) {
 	var compressed []byte
 	var compression sql.NullString
 
 	err := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT raw_data, compression FROM %smessage_raw WHERE message_id = ?
-	`, tablePrefix), messageID).Scan(&compressed, &compression)
+		SELECT mr.raw_data, mr.compression
+		FROM %smessage_raw mr
+		JOIN %smessages m ON m.id = mr.message_id
+		WHERE mr.message_id = ? AND m.deleted_from_source_at IS NULL
+	`, tablePrefix, tablePrefix), messageID).Scan(&compressed, &compression)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -229,14 +234,15 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, tablePrefix string
 			m.sent_at,
 			m.received_at,
 			COALESCE(m.size_estimate, 0),
-			m.has_attachments
+			m.has_attachments,
+			m.deleted_from_source_at
 		FROM %smessages m
 		LEFT JOIN %sconversations conv ON conv.id = m.conversation_id
 		WHERE %s
 	`, tablePrefix, tablePrefix, whereClause)
 
 	var msg MessageDetail
-	var sentAt, receivedAt sql.NullTime
+	var sentAt, receivedAt, deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, query, args...).Scan(
 		&msg.ID,
 		&msg.SourceMessageID,
@@ -248,6 +254,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, tablePrefix string
 		&receivedAt,
 		&msg.SizeEstimate,
 		&msg.HasAttachments,
+		&deletedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -262,6 +269,10 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, tablePrefix string
 	if receivedAt.Valid {
 		t := receivedAt.Time
 		msg.ReceivedAt = &t
+	}
+	if deletedAt.Valid {
+		t := deletedAt.Time
+		msg.DeletedAt = &t
 	}
 
 	// Fetch body from separate table (PK lookup, avoids scanning large body B-tree)

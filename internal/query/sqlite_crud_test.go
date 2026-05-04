@@ -1166,3 +1166,60 @@ func TestGetMessageRaw_NotFound(t *testing.T) {
 		t.Errorf("GetMessageRaw = %q, want nil", got)
 	}
 }
+
+// TestGetMessageRaw_FiltersDeletedFromSource verifies that GetMessageRaw
+// refuses to serve raw MIME for messages whose deleted_from_source_at is
+// set, keeping the raw-MIME endpoint aligned with how list/search hide
+// deleted-from-source messages.
+func TestGetMessageRaw_FiltersDeletedFromSource(t *testing.T) {
+	env := newTestEnv(t)
+	rawMIME := []byte("From: test@example.com\r\nSubject: Test\r\n\r\nHello")
+
+	msgID := env.AddMessage(dbtest.MessageOpts{Subject: "Deleted", SentAt: "2024-06-01 12:00:00"})
+	if _, err := env.DB.Exec(
+		`INSERT INTO message_raw (message_id, raw_data, raw_format, compression) VALUES (?, ?, 'mime', 'none')`,
+		msgID, rawMIME,
+	); err != nil {
+		t.Fatalf("insert message_raw: %v", err)
+	}
+	if _, err := env.DB.Exec(
+		`UPDATE messages SET deleted_from_source_at = '2024-06-02 12:00:00' WHERE id = ?`,
+		msgID,
+	); err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+
+	got, err := env.Engine.GetMessageRaw(env.Ctx, msgID)
+	if err != nil {
+		t.Fatalf("GetMessageRaw: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for deleted-from-source message, got %d bytes", len(got))
+	}
+}
+
+// TestGetMessage_PopulatesDeletedAt verifies that the engine's GetMessage
+// surfaces deleted_from_source_at via MessageDetail.DeletedAt so the API
+// can include it in detail responses.
+func TestGetMessage_PopulatesDeletedAt(t *testing.T) {
+	env := newTestEnv(t)
+
+	msgID := env.AddMessage(dbtest.MessageOpts{Subject: "Soft-deleted", SentAt: "2024-06-01 12:00:00"})
+	if _, err := env.DB.Exec(
+		`UPDATE messages SET deleted_from_source_at = '2024-06-02 12:00:00' WHERE id = ?`,
+		msgID,
+	); err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+
+	msg, err := env.Engine.GetMessage(env.Ctx, msgID)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("GetMessage returned nil for deleted message; expected the message with DeletedAt set")
+	}
+	if msg.DeletedAt == nil {
+		t.Errorf("DeletedAt = nil, want non-nil for deleted message")
+	}
+}

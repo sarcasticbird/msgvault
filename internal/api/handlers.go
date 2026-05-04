@@ -334,6 +334,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 				Cc:             ccAddrs,
 				Bcc:            bccAddrs,
 				SentAt:         qMsg.SentAt.UTC().Format(time.RFC3339),
+				DeletedAt:      formatDeletedAt(qMsg.DeletedAt),
 				Snippet:        qMsg.Snippet,
 				Labels:         labels,
 				HasAttach:      qMsg.HasAttachments,

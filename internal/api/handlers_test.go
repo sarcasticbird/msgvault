@@ -277,6 +277,46 @@ func TestHandleGetMessage_EngineBodyHTML(t *testing.T) {
 	if resp["from"] != "Sender <sender@example.com>" {
 		t.Errorf("from = %q, want %q", resp["from"], "Sender <sender@example.com>")
 	}
+	if _, ok := resp["deleted_at"]; ok {
+		t.Errorf("deleted_at should be omitted for live message, got %v", resp["deleted_at"])
+	}
+}
+
+// TestHandleGetMessage_EngineDeletedAt verifies the engine path surfaces
+// deleted_at in the response when the underlying message has a
+// deleted_from_source_at timestamp.
+func TestHandleGetMessage_EngineDeletedAt(t *testing.T) {
+	deletedAt := time.Date(2024, 7, 1, 9, 30, 0, 0, time.UTC)
+	engine := &querytest.MockEngine{
+		Messages: map[int64]*query.MessageDetail{
+			42: {
+				ID:        42,
+				Subject:   "Deleted",
+				From:      []query.Address{{Email: "sender@example.com"}},
+				SentAt:    time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC),
+				DeletedAt: &deletedAt,
+				BodyText:  "hello",
+			},
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/42", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	want := deletedAt.Format(time.RFC3339)
+	if got := resp["deleted_at"]; got != want {
+		t.Errorf("deleted_at = %v, want %q", got, want)
+	}
 }
 
 func TestHandleSearchMissingQuery(t *testing.T) {
