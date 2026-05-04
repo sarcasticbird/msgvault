@@ -1626,7 +1626,7 @@ func (s *Server) handleMessageInline(w http.ResponseWriter, r *http.Request) {
 
 	raw, err := s.engine.GetMessageRaw(r.Context(), id)
 	if err != nil {
-		s.logger.Error("failed to get raw MIME for inline part", "error", err, "id", id)
+		s.logger.Error("failed to get raw MIME for inline part", "error", err, "id", id, "cid", cidParam)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load message")
 		return
 	}
@@ -1637,7 +1637,7 @@ func (s *Server) handleMessageInline(w http.ResponseWriter, r *http.Request) {
 
 	parsed, err := mime.Parse(raw)
 	if err != nil {
-		s.logger.Error("failed to parse MIME for inline part", "error", err, "id", id)
+		s.logger.Error("failed to parse MIME for inline part", "error", err, "id", id, "cid", cidParam)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to parse message")
 		return
 	}

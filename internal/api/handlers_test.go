@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -2089,9 +2091,10 @@ func TestHandleStats_VectorEnabledWithActive(t *testing.T) {
 	}
 }
 
-// rawMIMEWithInlineImage returns a multipart MIME message with an inline
-// image part identified by the given CID and content type.
-func rawMIMEWithInlineImage(cid, contentType string, body []byte) []byte {
+// rawMIMEWithImagePart returns a multipart MIME message containing a single
+// image part with the given Content-ID, content type, and Content-Disposition
+// (typically "inline" or "attachment").
+func rawMIMEWithImagePart(cid, contentType, disposition string, body []byte) []byte {
 	boundary := "test-boundary-123"
 	var b strings.Builder
 	b.WriteString("MIME-Version: 1.0\r\n")
@@ -2103,54 +2106,18 @@ func rawMIMEWithInlineImage(cid, contentType string, body []byte) []byte {
 	b.WriteString("<html><body><img src=\"cid:" + cid + "\"></body></html>\r\n")
 	b.WriteString("--" + boundary + "\r\n")
 	b.WriteString("Content-Type: " + contentType + "\r\n")
-	b.WriteString("Content-Disposition: inline\r\n")
+	b.WriteString("Content-Disposition: " + disposition + "\r\n")
 	b.WriteString("Content-ID: <" + cid + ">\r\n")
 	b.WriteString("Content-Transfer-Encoding: base64\r\n")
 	b.WriteString("\r\n")
-	// Encode body as base64
-	encoded := make([]byte, 0, len(body)*2)
-	for i := 0; i < len(body); i += 57 {
-		end := i + 57
-		if end > len(body) {
-			end = len(body)
-		}
-		chunk := body[i:end]
-		dst := make([]byte, (len(chunk)*4+2)/3+4)
-		n := copy(dst, []byte(encodeBase64(chunk)))
-		encoded = append(encoded, dst[:n]...)
-		encoded = append(encoded, '\r', '\n')
-	}
-	b.Write(encoded)
-	b.WriteString("--" + boundary + "--\r\n")
+	b.WriteString(base64.StdEncoding.EncodeToString(body))
+	b.WriteString("\r\n--" + boundary + "--\r\n")
 	return []byte(b.String())
 }
 
-func encodeBase64(data []byte) string {
-	const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	var out []byte
-	for i := 0; i < len(data); i += 3 {
-		var val uint32
-		remaining := len(data) - i
-		for j := 0; j < 3; j++ {
-			val <<= 8
-			if j < remaining {
-				val |= uint32(data[i+j])
-			}
-		}
-		out = append(out, table[(val>>18)&0x3F])
-		out = append(out, table[(val>>12)&0x3F])
-		if remaining > 1 {
-			out = append(out, table[(val>>6)&0x3F])
-		} else {
-			out = append(out, '=')
-		}
-		if remaining > 2 {
-			out = append(out, table[val&0x3F])
-		} else {
-			out = append(out, '=')
-		}
-	}
-	return string(out)
+// rawMIMEWithInlineImage is a convenience wrapper for the common inline case.
+func rawMIMEWithInlineImage(cid, contentType string, body []byte) []byte {
+	return rawMIMEWithImagePart(cid, contentType, "inline", body)
 }
 
 func TestHandleMessageInline_ImagePNG(t *testing.T) {
@@ -2180,6 +2147,30 @@ func TestHandleMessageInline_ImagePNG(t *testing.T) {
 	}
 	if cd := w.Header().Get("Content-Disposition"); cd != "inline" {
 		t.Errorf("Content-Disposition = %q, want 'inline'", cd)
+	}
+	if !bytes.Equal(w.Body.Bytes(), imgData) {
+		t.Errorf("response body = %x, want %x", w.Body.Bytes(), imgData)
+	}
+}
+
+// TestHandleMessageInline_NonInlineSkipped ensures that a part with a matching
+// Content-ID but Content-Disposition: attachment is not served via the inline
+// endpoint — only parts flagged IsInline by the MIME parser should be reachable.
+func TestHandleMessageInline_NonInlineSkipped(t *testing.T) {
+	imgData := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	raw := rawMIMEWithImagePart("logo@example", "image/png", "attachment", imgData)
+
+	engine := &querytest.MockEngine{
+		RawMessages: map[int64][]byte{1: raw},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/1/inline/logo@example", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d for non-inline attachment", w.Code, http.StatusNotFound)
 	}
 }
 
