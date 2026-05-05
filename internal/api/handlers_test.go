@@ -20,6 +20,7 @@ import (
 	"github.com/wesm/msgvault/internal/config"
 	"github.com/wesm/msgvault/internal/query"
 	"github.com/wesm/msgvault/internal/query/querytest"
+	"github.com/wesm/msgvault/internal/remote"
 	"github.com/wesm/msgvault/internal/vector"
 	"github.com/wesm/msgvault/internal/vector/hybrid"
 )
@@ -2339,5 +2340,64 @@ func TestHandleMessageInline_MissingCID(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d for missing cid", w.Code, http.StatusBadRequest)
+	}
+}
+
+// TestHandleMessageInline_UnsupportedEngine verifies that engines which
+// can't fetch raw MIME (Postgres scaffold, remote engine) surface a stable
+// 501 instead of a generic 500.
+func TestHandleMessageInline_UnsupportedEngine(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"ErrNotImplemented", query.ErrNotImplemented},
+		{"ErrNotSupported", remote.ErrNotSupported},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := &querytest.MockEngine{
+				GetMessageRawFunc: func(_ context.Context, _ int64) ([]byte, error) {
+					return nil, tc.err
+				},
+			}
+			srv := newTestServerWithEngine(t, engine)
+
+			req := httptest.NewRequest("GET", inlineURL(1, "logo@example"), nil)
+			w := httptest.NewRecorder()
+			srv.Router().ServeHTTP(w, req)
+
+			if w.Code != http.StatusNotImplemented {
+				t.Errorf("status = %d, want %d", w.Code, http.StatusNotImplemented)
+			}
+		})
+	}
+}
+
+// TestHandleGetMessage_EngineUnsupportedFallsBackToStore verifies that when
+// the configured engine reports the operation is unsupported, the handler
+// falls through to the store path so engine-only errors don't break detail
+// responses for engines that don't implement GetMessage.
+func TestHandleGetMessage_EngineUnsupportedFallsBackToStore(t *testing.T) {
+	engine := &querytest.MockEngine{
+		GetMessageFunc: func(_ context.Context, _ int64) (*query.MessageDetail, error) {
+			return nil, query.ErrNotImplemented
+		},
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/1", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["subject"] != "Test Subject" {
+		t.Errorf("subject = %q, want %q (store path response)", resp["subject"], "Test Subject")
 	}
 }
