@@ -38,7 +38,10 @@ type MockEngine struct {
 	GetGmailIDsByFilterFunc      func(context.Context, query.MessageFilter) ([]string, error)
 	SearchByDomainsFunc          func(context.Context, []string, *time.Time, *time.Time, int, int) ([]query.MessageSummary, error)
 	SearchFastWithStatsFunc      func(context.Context, *search.Query, string, query.MessageFilter, query.ViewType, int, int) (*query.SearchFastResult, error)
+	GetMessageRawFunc            func(context.Context, int64) ([]byte, error)
 	GetMessageSummariesByIDsFunc func(context.Context, []int64) ([]query.MessageSummary, error)
+
+	RawMessages map[int64][]byte
 }
 
 // Compile-time check.
@@ -118,6 +121,18 @@ func (m *MockEngine) GetAttachment(_ context.Context, id int64) (*query.Attachme
 	if m.Attachments != nil {
 		if a, ok := m.Attachments[id]; ok {
 			return a, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *MockEngine) GetMessageRaw(ctx context.Context, id int64) ([]byte, error) {
+	if m.GetMessageRawFunc != nil {
+		return m.GetMessageRawFunc(ctx, id)
+	}
+	if m.RawMessages != nil {
+		if raw, ok := m.RawMessages[id]; ok {
+			return raw, nil
 		}
 	}
 	return nil, nil
